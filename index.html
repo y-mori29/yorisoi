@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>よりそい LIFF</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+</head>
+<body>
+  <h1>よりそい（LIFFテスト）</h1>
+  <p id="status">初期化中...</p>
+  <button id="loginBtn">LINEでログイン</button>
+  <button id="profileBtn">プロフィール表示</button>
+  <pre id="out"></pre>
+
+  <script>
+    const LIFF_ID = "ここに発行されたLIFF IDを入れる";
+
+    async function init() {
+      await liff.init({ liffId: LIFF_ID });
+      document.getElementById('status').textContent = 'LIFF初期化OK';
+      if (!liff.isLoggedIn()) {
+        document.getElementById('loginBtn').onclick = () => liff.login();
+      } else {
+        document.getElementById('loginBtn').textContent = 'ログイン済み';
+      }
+      document.getElementById('profileBtn').onclick = showProfile;
+    }
+
+    async function showProfile() {
+      try {
+        const profile = await liff.getProfile();
+        const idToken = liff.getIDToken();
+        document.getElementById('out').textContent =
+          JSON.stringify({ displayName: profile.displayName, userId: profile.userId, idToken: !!idToken }, null, 2);
+      } catch (e) {
+        document.getElementById('out').textContent = 'プロフィール取得エラー: ' + e;
+      }
+    }
+    init();
+  </script>
+</body>
+</html>
