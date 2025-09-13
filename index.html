@@ -447,6 +447,7 @@ document.addEventListener('DOMContentLoaded', () => {
   initLiffAndRoute();
 });
 
+// ここから下はテスト用としてfinishで音声ファイル送信するために一時的に追加した部分です。実際の処理では不要20250913森
 // blob は録音で得たもの（MediaRecorder の chunk を結合して得た Blob）
 async function sendFinishWithFile(sessionId, blob) {
   const form = new FormData();
@@ -462,9 +463,12 @@ async function sendFinishWithFile(sessionId, blob) {
   const j = await res.json();
   console.log('finish result', j);
 }
+// ここまで追加分
+  
 </script>
 </body>
 </html>
+
 
 
 
