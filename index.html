@@ -1,44 +1,373 @@
 <!doctype html>
-<html>
+<html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>よりそい LIFF</title>
-  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>よりそい LIFF</title>
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<style>
+  :root {
+    --primary-color: #007bff;
+    --danger-color: #dc3545;
+    --secondary-color: #6c757d;
+    --bg-light: #f8f9fa;
+    --bg-app: #f0f2f5;
+    --text-dark: #343a40;
+    --text-light: #ffffff;
+    --border-color: #dee2e6;
+  }
+  
+  /* 基本設定 */
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background-color: var(--bg-app);
+    margin: 0;
+    padding: 16px;
+    color: var(--text-dark);
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-height: 100vh;
+    box-sizing: border-box;
+  }
+
+  .container {
+    width: 100%;
+    max-width: 480px;
+    background-color: var(--text-light);
+    border-radius: 12px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    padding: 24px;
+    box-sizing: border-box;
+  }
+
+  /* ヘッダー */
+  header {
+    font-size: 24px;
+    font-weight: bold;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  p, li {
+    line-height: 1.6;
+    color: #555;
+  }
+
+  .hidden {
+    display: none;
+  }
+  
+  /* ボタン */
+  button {
+    display: block;
+    width: 100%;
+    padding: 12px 16px;
+    border-radius: 8px;
+    margin: 16px 0 8px;
+    border: none;
+    font-size: 16px;
+    font-weight: bold;
+    color: var(--text-light);
+    cursor: pointer;
+    transition: background-color 0.2s ease, transform 0.1s ease;
+  }
+
+  button:not(:disabled):hover {
+    opacity: 0.9;
+  }
+  button:not(:disabled):active {
+    transform: scale(0.98);
+  }
+  button:disabled {
+    background-color: #ccc;
+    cursor: not-allowed;
+    opacity: 0.7;
+  }
+
+  #startBtn { background-color: var(--primary-color); }
+  #stopBtn { background-color: var(--danger-color); }
+  #refreshHistory { background-color: var(--secondary-color); }
+
+  /* 録音ビュー */
+  #download {
+    margin-top: 16px;
+    padding: 12px;
+    background-color: var(--bg-light);
+    border-radius: 6px;
+    text-align: center;
+    color: var(--text-dark);
+    min-height: 1.5em;
+  }
+  #download a {
+    color: var(--primary-color);
+    font-weight: bold;
+    text-decoration: none;
+  }
+  #download a:hover {
+    text-decoration: underline;
+  }
+
+  /* 履歴ビュー */
+  #historyList {
+    list-style: none;
+    padding: 0;
+    margin-top: 16px;
+  }
+
+  #historyList li {
+    background-color: var(--bg-light);
+    padding: 12px;
+    border-radius: 6px;
+    margin-bottom: 8px;
+    border-left: 4px solid var(--primary-color);
+  }
+
+  /* ヘルプビュー */
+  #helpView h3 {
+    font-size: 18px;
+    margin-top: 20px;
+    margin-bottom: 10px;
+    border-left: 4px solid var(--primary-color);
+    padding-left: 8px;
+  }
+  #helpView ol {
+    padding-left: 20px;
+  }
+  .warn {
+    background-color: #fffbe6;
+    border: 1px solid #ffe58f;
+    border-radius: 6px;
+    padding: 12px;
+    color: #8a6d3b;
+    margin-top: 16px;
+  }
+
+  /* ログ表示エリア */
+  #log {
+    white-space: pre-wrap;
+    background: #282c34;
+    color: #abb2bf;
+    padding: 12px;
+    border-radius: 6px;
+    margin-top: 24px;
+    font-family: 'Menlo', 'Consolas', monospace;
+    font-size: 12px;
+    max-height: 150px;
+    overflow-y: auto;
+    word-break: break-all;
+  }
+</style>
 </head>
 <body>
-  <h1>よりそい（LIFFテスト）</h1>
-  <p id="status">初期化中...</p>
-  <button id="loginBtn">LINEでログイン</button>
-  <button id="profileBtn">プロフィール表示</button>
-  <pre id="out"></pre>
+  <div class="container">
+    <header id="title">よりそい</header>
 
-  <script>
-    const LIFF_ID = "2008082630-ry2J7971";
+    <div id="tabs">
+      <div id="recordView" class="hidden">
+        <p>診察の会話を録音して、解析します。</p>
+        <button id="startBtn">録音をはじめる</button>
+        <button id="stopBtn" disabled>録音をおわる</button>
+        <div id="download"></div>
+      </div>
 
-    async function init() {
-      await liff.init({ liffId: LIFF_ID });
-      document.getElementById('status').textContent = 'LIFF初期化OK';
-      if (!liff.isLoggedIn()) {
-        document.getElementById('loginBtn').onclick = () => liff.login();
+      <div id="historyView" class="hidden">
+        <p>過去の診察メモ履歴です。</p>
+        <ul id="historyList"></ul>
+        <button id="refreshHistory">更新</button>
+      </div>
+
+      <div id="helpView" class="hidden">
+        <h3>使い方</h3>
+        <ol>
+          <li>「録音をはじめる」ボタンで録音を開始します。</li>
+          <li>診察が終わったら「録音をおわる」ボタンで録音を終了します。</li>
+          <li>処理が終わると、まとめがLINEに届きます。</li>
+        </ol>
+        <p class="warn">iPhoneでは画面を閉じると録音が止まります。録音中は画面を開いたままにしてください。</p>
+      </div>
+    </div>
+
+    <div id="log"></div>
+  </div>
+
+<script>
+/* --- 設定 (必要に応じて置き換えてください) --- */
+const LIFF_ID = "2008082630-ry2J7971";
+const USE_UPLOAD = true; // true にするとチャンクをサーバへ送信します
+const UPLOAD_URL = "https://your-cloudrun.example/upload-chunk";
+const FINISH_URL  = "https://your-cloudrun.example/finish";
+const HISTORY_URL = "https://your-cloudrun.example/history"; // GET ?userId=...
+
+/* --- UI elements --- */
+const el = id => document.getElementById(id);
+const log = (s) => { 
+  el('log').textContent += s + "\n";
+  el('log').scrollTop = el('log').scrollHeight; // 自動スクロール
+}
+
+/* --- タブ判定 --- */
+function getTab() {
+  const p = new URLSearchParams(location.search);
+  return (p.get('tab') || 'record').toLowerCase();
+}
+
+/* --- LIFF 初期化 --- */
+async function initLiffAndRoute() {
+  try {
+    await liff.init({ liffId: LIFF_ID });
+    log('LIFF initialized');
+    // ログイン確認
+    if (!liff.isLoggedIn()) {
+      log('ログインしていません → ログインします');
+      // loginはユーザー操作で呼んだ方がUXよし。ここでは自動的に出す
+      liff.login();
+      return;
+    }
+    log('ログイン済み');
+    routeTab(getTab());
+  } catch (e) {
+    log('LIFF 初期化エラー: ' + e);
+  }
+}
+
+/* --- タブ表示 --- */
+function hideAll() {
+  ['recordView','historyView','helpView'].forEach(id => el(id).classList.add('hidden'));
+}
+function routeTab(tab) {
+  hideAll();
+  if (tab === 'record') {
+    el('title').textContent = '診察メモ：録音';
+    el('recordView').classList.remove('hidden');
+  } else if (tab === 'history') {
+    el('title').textContent = '診察メモ：過去メモ';
+    el('historyView').classList.remove('hidden');
+    loadHistory();
+  } else {
+    el('title').textContent = '診察メモ：使い方';
+    el('helpView').classList.remove('hidden');
+  }
+}
+
+/* --- 録音ロジック（MediaRecorder） --- */
+let stream = null, recorder = null, sessionId = null, seq = 0, chunks = [];
+
+function pickMime() {
+  const cand = ['audio/webm;codecs=opus','audio/webm','audio/mp4','video/mp4'];
+  for (const t of cand) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
+async function startRec() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = pickMime();
+    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    sessionId = crypto.randomUUID();
+    seq = 0;
+    chunks = [];
+    el('download').textContent = `録音中…`;
+    el('startBtn').disabled = true;
+    el('stopBtn').disabled = false;
+
+    recorder.ondataavailable = async (ev) => {
+      if (!ev.data || ev.data.size === 0) return;
+      if (USE_UPLOAD) {
+        await uploadChunk(ev.data);
       } else {
-        document.getElementById('loginBtn').textContent = 'ログイン済み';
+        chunks.push(ev.data);
       }
-      document.getElementById('profileBtn').onclick = showProfile;
-    }
+    };
+    recorder.onerror = e => log('Recorder error:' + e);
+    recorder.start(5000); // 5秒チャンク
+    log('録音開始: mime=' + (recorder.mimeType || 'default'));
+  } catch (err) {
+    log('マイク取得失敗: ' + err);
+  }
+}
 
-    async function showProfile() {
-      try {
-        const profile = await liff.getProfile();
-        const idToken = liff.getIDToken();
-        document.getElementById('out').textContent =
-          JSON.stringify({ displayName: profile.displayName, userId: profile.userId, idToken: !!idToken }, null, 2);
-      } catch (e) {
-        document.getElementById('out').textContent = 'プロフィール取得エラー: ' + e;
-      }
+async function stopRec() {
+  try {
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    stream && stream.getTracks().forEach(t=>t.stop());
+    el('startBtn').disabled = false;
+    el('stopBtn').disabled = true;
+    if (USE_UPLOAD) {
+      // finish を通知。サーバ側で結合〜STT〜要約まで走らせる想定
+      const idToken = liff.getIDToken() || '';
+      await fetch(FINISH_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sessionId, idToken }) });
+      log('finish通知 送信済');
+      el('download').textContent = 'アップロード完了。結果はLINEに届きます。';
+    } else {
+      // ローカル結合ダウンロード
+      const type = pickMime() || (chunks[0]?.type || 'audio/webm');
+      const blob = new Blob(chunks, { type });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `yorisoi-${new Date().toISOString().replace(/[:.]/g,'-')}.${type.includes('mp4')?'mp4':'webm'}`;
+      a.textContent = '録音をダウンロード';
+      el('download').innerHTML = '';
+      el('download').appendChild(a);
+      log('ローカル保存モード: 録音停止');
     }
-    init();
-  </script>
+  } catch (e) {
+    log('停止エラー:' + e);
+  }
+}
+
+async function uploadChunk(blob) {
+  seq++;
+  const fd = new FormData();
+  fd.append('sessionId', sessionId);
+  fd.append('seq', String(seq));
+  fd.append('blob', blob, `chunk-${seq}.bin`);
+  fd.append('idToken', liff.getIDToken() || '');
+  try {
+    const res = await fetch(UPLOAD_URL, { method:'POST', body: fd, credentials: 'include' });
+    if (!res.ok) throw new Error(await res.text());
+    log('chunk uploaded seq=' + seq);
+  } catch (e) {
+    log('chunk upload error: ' + e);
+  }
+}
+
+/* --- 履歴取得（サーバに依存） --- */
+async function loadHistory() {
+  try {
+    el('historyList').innerHTML = '<li>読み込み中…</li>';
+    const prof = await liff.getProfile();
+    const userId = prof.userId;
+    const res = await fetch(HISTORY_URL + '?userId=' + encodeURIComponent(userId));
+    if (!res.ok) throw new Error(await res.text());
+    const items = await res.json();
+    if (!Array.isArray(items) || items.length === 0) { 
+      el('historyList').innerHTML = '<li>履歴データがありません</li>'; 
+      return; 
+    }
+    el('historyList').innerHTML = '';
+    items.forEach(it => {
+      const li = document.createElement('li');
+      li.textContent = `${it.date || ''} — ${it.title || it.summary || ''}`;
+      el('historyList').appendChild(li);
+    });
+    log('履歴読み込み: ' + items.length + ' 件');
+  } catch (e) {
+    el('historyList').innerHTML = '<li>履歴取得エラー</li>';
+    log('history load error: ' + e);
+  }
+}
+
+/* --- イベント割当 --- */
+document.addEventListener('DOMContentLoaded', () => {
+  el('startBtn').onclick = startRec;
+  el('stopBtn').onclick = stopRec;
+  el('refreshHistory').onclick = loadHistory;
+  initLiffAndRoute();
+});
+</script>
 </body>
 </html>
-
