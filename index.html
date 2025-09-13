@@ -446,9 +446,26 @@ document.addEventListener('DOMContentLoaded', () => {
   el('refreshHistory').onclick = loadHistory;
   initLiffAndRoute();
 });
+
+// 例: blob は録音で得たもの（MediaRecorder の chunk を結合して得た Blob）
+async function sendFinishWithFile(sessionId, blob) {
+  const form = new FormData();
+  form.append('sessionId', sessionId);
+  // File に変換して名前と MIME を付ける（m4aなら 'audio/mp4' 等）
+  const file = new File([blob], 'recording.m4a', { type: 'audio/mp4' });
+  form.append('audio', file);
+
+  const res = await fetch(FINISH_URL, {
+    method: 'POST',
+    body: form
+  });
+  const j = await res.json();
+  console.log('finish result', j);
+}
 </script>
 </body>
 </html>
+
 
 
 
