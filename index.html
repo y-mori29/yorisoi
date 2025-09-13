@@ -407,7 +407,7 @@ async function uploadChunk(blob) {
   fd.append('blob', blob, `chunk-${seq}.bin`);
   fd.append('idToken', liff.getIDToken() || '');
   try {
-    const res = await fetch(UPLOAD_URL, { method:'POST', body: fd, credentials: 'include' });
+  const res = await fetch(UPLOAD_URL, { method:'POST', body: fd });
     if (!res.ok) throw new Error(await res.text());
     log('chunk uploaded seq=' + seq);
   } catch (e) { log('chunk upload error: ' + e); }
@@ -449,4 +449,5 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 </body>
 </html>
+
 
