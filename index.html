@@ -271,11 +271,22 @@
 
 <script>
 /* --- 設定 (必要に応じて置き換えてください) --- */
+let USER_ID = null;
+const LIFF_ID = "2008082630-ry2J7971";
+const USE_UPLOAD = true;
+const API_BASE = "https://98cbe348b922.ngrok-free.app";
+const UPLOAD_URL   = `${API_BASE}/upload-chunk`;
+const FINALIZE_URL = `${API_BASE}/finalize`;
+const JOB_URL      = (id) => `${API_BASE}/jobs/${id}`;
+const HISTORY_URL = `${API_BASE}/history`;
+
+/* --- 設定（旧ver）  
 const LIFF_ID = "2008082630-ry2J7971";
 const USE_UPLOAD = true;
 const UPLOAD_URL = "https://98cbe348b922.ngrok-free.app/upload-chunk";
 const FINISH_URL  = "https://98cbe348b922.ngrok-free.app/finish";
 const HISTORY_URL = "https://98cbe348b922.ngrok-free.app/history";
+*/
 
 /* --- UI elements --- */
 const el = id => document.getElementById(id);
@@ -295,6 +306,30 @@ async function initLiffAndRoute() {
   try {
     await liff.init({ liffId: LIFF_ID });
     log('LIFF initialized');
+
+    if (!liff.isLoggedIn()) {
+      log('ログインしていません → ログインします');
+      liff.login();         // ログイン後は自動で戻ってくる
+      return;               // いったん終了（戻ってきたらまた実行される）
+    }
+
+    // ★ここで一度だけユーザーIDを取って、グローバルに保持
+    const prof = await liff.getProfile();
+    USER_ID = prof.userId;
+    log('ログイン済み userId=' + USER_ID);
+
+    // 既存のタブ切り替えへ
+    routeTab(getTab());
+  } catch (e) {
+    log('LIFF 初期化エラー: ' + e);
+  }
+}
+
+/* --- LIFF 初期化（旧ver） --- */
+/*async function initLiffAndRoute() {
+  try {
+    await liff.init({ liffId: LIFF_ID });
+    log('LIFF initialized');
     if (!liff.isLoggedIn()) {
       log('ログインしていません → ログインします');
       liff.login();
@@ -303,7 +338,7 @@ async function initLiffAndRoute() {
     log('ログイン済み');
     routeTab(getTab());
   } catch (e) { log('LIFF 初期化エラー: ' + e); }
-}
+}*/
 
 /* --- タブ表示 --- */
 function hideAll() {
@@ -361,7 +396,7 @@ async function startRec() {
       else chunks.push(ev.data);
     };
     recorder.onerror = e => log('マイクエラー:' + e);
-    recorder.start(5000); // 5秒チャンク
+    recorder.start(10000); // 10秒チャンク
     log('メモ作成開始: mime=' + (recorder.mimeType || 'default'));
   } catch (err) {
     log('マイクの利用許可が必要です: ' + err);
@@ -378,7 +413,49 @@ async function stopRec() {
     el('statusArea').querySelector('.warn-iphone').classList.add('hidden');
     el('startBtn').disabled = false;
     el('stopBtn').disabled = true;
-    
+
+if (USE_UPLOAD) {
+  // 1) 結合→GCS→非同期STTを開始
+  const r = await fetch(FINALIZE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId, userId: USER_ID })
+  });
+  const j = await r.json();
+  if (!j.ok) { log('finalize error: ' + j.error); alert('サーバ処理でエラー: ' + j.error); return; }
+  log('finalize開始 jobId=' + j.jobId);
+  el('download').textContent = '文字起こし中…しばらくお待ちください。';
+
+  // 2) 完了まで数秒おきに確認
+  let done = false;
+  while (!done) {
+    await new Promise(res => setTimeout(res, 4000));
+    const st = await (await fetch(JOB_URL(j.jobId))).json();
+    if (st.status === 'DONE') {
+      done = true;
+      el('download').textContent = '要約をLINEに送りました ✅';
+      log('STT完了＆LINE送信');
+    } else {
+      log('STT進行中…');
+    }
+  }
+  } else {
+      const type = pickMime() || (chunks[0]?.type || 'audio/webm');
+      const blob = new Blob(chunks, { type });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `yorisoi-memo-${new Date().toISOString().replace(/[:.]/g,'-')}.${type.includes('mp4')?'mp4':'webm'}`;
+      a.textContent = 'メモデータをダウンロード';
+      const dlContainer = el('download');
+      dlContainer.innerHTML = '';
+      dlContainer.appendChild(a);
+      log('ローカル保存モード: 作成停止');
+    }
+  } catch (e) { log('停止エラー:' + e); }
+}
+
+  /* --- 旧バージョン --- */
+  /*
     if (USE_UPLOAD) {
       const idToken = liff.getIDToken() || '';
       await fetch(FINISH_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ sessionId, idToken }) });
@@ -398,14 +475,26 @@ async function stopRec() {
     }
   } catch (e) { log('停止エラー:' + e); }
 }
-
+*/
+  
 async function uploadChunk(blob) {
   seq++;
   const fd = new FormData();
+  fd.append('userId', USER_ID || '');
+  fd.append('sessionId', sessionId);
+  fd.append('file', blob, `chunk-${seq}.webm`);
+
+
+  /* --- 旧バージョン --- */
+  /*
+  fd.append('userId', USER_ID || '');
   fd.append('sessionId', sessionId);
   fd.append('seq', String(seq));
   fd.append('blob', blob, `chunk-${seq}.bin`);
   fd.append('idToken', liff.getIDToken() || '');
+  */
+  /* --- ここまで --- */
+
   try {
   const res = await fetch(UPLOAD_URL, { method:'POST', body: fd });
     if (!res.ok) throw new Error(await res.text());
@@ -446,28 +535,11 @@ document.addEventListener('DOMContentLoaded', () => {
   el('refreshHistory').onclick = loadHistory;
   initLiffAndRoute();
 });
-
-// ここから下はテスト用としてfinishで音声ファイル送信するために一時的に追加した部分です。実際の処理では不要20250913森
-// blob は録音で得たもの（MediaRecorder の chunk を結合して得た Blob）
-async function sendFinishWithFile(sessionId, blob) {
-  const form = new FormData();
-  form.append('sessionId', sessionId);
-  // File に変換して名前と MIME を付ける（m4aなら 'audio/mp4' 等）
-  const file = new File([blob], 'recording.m4a', { type: 'audio/mp4' });
-  form.append('audio', file);
-
-  const res = await fetch(FINISH_URL, {
-    method: 'POST',
-    body: form
-  });
-  const j = await res.json();
-  console.log('finish result', j);
-}
-// ここまで追加分
-  
+ 
 </script>
 </body>
 </html>
+
 
 
 
