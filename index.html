@@ -396,7 +396,7 @@ async function startRec() {
       else chunks.push(ev.data);
     };
     recorder.onerror = e => log('マイクエラー:' + e);
-    recorder.start(10000); // 10秒チャンク
+    recorder.start(30000); // 30秒チャンク
     log('メモ作成開始: mime=' + (recorder.mimeType || 'default'));
   } catch (err) {
     log('マイクの利用許可が必要です: ' + err);
@@ -529,6 +529,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 </body>
 </html>
+
 
 
 
