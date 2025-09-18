@@ -482,18 +482,8 @@ async function uploadChunk(blob) {
   const fd = new FormData();
   fd.append('userId', USER_ID || '');
   fd.append('sessionId', sessionId);
-  fd.append('file', blob, `chunk-${seq}.webm`);
-
-
-  /* --- 旧バージョン --- */
-  /*
-  fd.append('userId', USER_ID || '');
-  fd.append('sessionId', sessionId);
   fd.append('seq', String(seq));
-  fd.append('blob', blob, `chunk-${seq}.bin`);
-  fd.append('idToken', liff.getIDToken() || '');
-  */
-  /* --- ここまで --- */
+  fd.append('file', blob, `chunk-${seq}.webm`);
 
   try {
   const res = await fetch(UPLOAD_URL, { method:'POST', body: fd });
@@ -539,6 +529,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 </body>
 </html>
+
 
 
 
