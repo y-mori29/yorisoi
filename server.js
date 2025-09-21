@@ -9,7 +9,6 @@ const { Storage } = require("@google-cloud/storage");
 const speech = require("@google-cloud/speech").v1p1beta1;
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { execFile } = require("child_process");
-
 const PORT = process.env.PORT || 8080;
 const ORIGIN = process.env.ALLOW_ORIGIN || "*";
 const DATA_DIR = process.env.DATA_DIR || "/tmp/data";
@@ -248,9 +247,15 @@ app.post("/line/webhook", express.json(), async (req, res) => {
   }
 });
 
-app.get("/health", (_, res) => res.json({ ok: true }));
+// どこからでも受ける
+const HOST = '0.0.0.0';
 
-app.listen(PORT, () => console.log("yorisoi mvp listening on", PORT));
+// ヘルス用（Cloud Run は / で見ることが多い）
+app.get('/', (_, res) => res.json({ ok: true }));
+
+app.listen(PORT, HOST, () => {
+  console.log(`yorisoi mvp listening on ${HOST}:${PORT}`);
+});
 
 // ---- helper ----
 function execFFmpeg(args) {
@@ -260,4 +265,5 @@ function execFFmpeg(args) {
       resolve();
     });
   });
+
 }
