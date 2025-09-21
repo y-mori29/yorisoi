@@ -1,15 +1,23 @@
+# Dockerfile（リポジトリ直下）
 FROM node:18-alpine
-WORKDIR /app
 
-# ffmpeg を追加
+# ffmpeg はビルド時に入れておく（起動時に入れると遅くなる）
 RUN apk add --no-cache ffmpeg
 
-# 依存インストール
+WORKDIR /app
+
+# 依存を固定インストール
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 
-# ソース配置
+# アプリ本体をコピー
 COPY . .
 
+ENV NODE_ENV=production
+ENV PORT=8080
+
+# Cloud Run のヘルス/ルーティングのためのお作法
 EXPOSE 8080
-CMD ["npm","start"]
+
+# サーバ起動
+CMD ["node","server.js"]
