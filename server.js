@@ -143,10 +143,11 @@ if (wavPaths.length === 0) {
       const jobId = req.params.id;
 
     // 進捗取得（返り値は [operation] の配列）
-    const [operation] = await speechClient.checkLongRunningRecognizeProgress(jobId);
+    const operation = await speechClient.checkLongRunningRecognizeProgress(jobId);
     if (!operation.done) {
       return res.json({ ok: true, status: "RUNNING" });
     }
+    const [response] = await operation.promise();
     // 完了 → 結果（promise() で [response] ）
     const [response] = await operation.promise();
     const transcript = (response.results || [])
@@ -276,4 +277,5 @@ function execFFmpeg(args) {
   });
 
 }
+
 
