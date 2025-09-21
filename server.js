@@ -85,14 +85,23 @@ app.post("/finalize", async (req, res) => {
     fs.mkdirSync(wavsDir, { recursive: true });
 
     const wavPaths = [];
-    for (const f of chunks) {
-      const localSrc = path.join(workDir, path.basename(f.name));
-      await f.download({ destination: localSrc });
-      const out = path.join(wavsDir, path.basename(localSrc).replace(/\.(webm|mp4)$/,".wav"));
-      await execFFmpeg(["-i", localSrc, "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", out]);
-      wavPaths.push(out);
+for (const f of chunks) {
+  const localSrc = path.join(workDir, path.basename(f.name));
+  await f.download({ destination: localSrc });
+  const out = path.join(wavsDir, path.basename(localSrc).replace(/\.(webm|mp4)$/,".wav"));
+  try {
+    await execFFmpeg(["-i", localSrc, "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", out]);
+    wavPaths.push(out);
+  } catch (e) {
+    console.warn("ffmpeg failed for", f.name, e?.message);
+  } finally {
     try { fs.unlinkSync(localSrc); } catch {}
+  }
 }
+if (wavPaths.length === 0) {
+  return res.status(400).json({ ok:false, error:"all chunks invalid" });
+}
+
 
     // 3) WAVを無劣化連結（ffconcat + -c copy）
     const list = path.join(workDir, "wav-list.ffconcat");
@@ -267,3 +276,4 @@ function execFFmpeg(args) {
   });
 
 }
+
