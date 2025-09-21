@@ -147,7 +147,6 @@ if (wavPaths.length === 0) {
     if (!operation.done) {
       return res.json({ ok: true, status: "RUNNING" });
     }
-    const [response] = await operation.promise();
     // 完了 → 結果（promise() で [response] ）
     const [response] = await operation.promise();
     const transcript = (response.results || [])
@@ -277,5 +276,6 @@ function execFFmpeg(args) {
   });
 
 }
+
 
 
