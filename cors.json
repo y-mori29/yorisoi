@@ -1,0 +1,8 @@
+[
+  {
+    "origin": ["https://yorisoi.medi-canvas.com"],
+    "method": ["GET", "PUT", "POST", "HEAD", "DELETE", "OPTIONS"],
+    "responseHeader": ["Content-Type", "x-goog-resumable", "x-goog-meta-*", "Authorization", "Content-MD5"],
+    "maxAgeSeconds": 3600
+  }
+]
