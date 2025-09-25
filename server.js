@@ -262,7 +262,7 @@ app.get("/jobs/:id", async (req, res) => {
           await lineClient.pushMessage({
             to: meta.userId,
             messages: [
-              { type: "text", text: "■診察メモ\n（短い録音のためメモは作成しませんでした）" },
+              { type: "text", text: "■診察メモ\n（短い内容のためメモは作成しませんでした）" },
               { type: "text", text: `＜文字起こし全文＞\n${(transcript || "").slice(0, 4000)}` },
             ],
           });
@@ -364,7 +364,6 @@ ${transcript}
 
     // ---- LINE 送信（1通目：要約 / 2通目：全文文字起こし）----
 // ---- 整形（読みやすさ重視・セクション化）----
-const arr = (v) => Array.isArray(v) ? v : [];
 j.summary_top3 = arr(j.summary_top3);
 j.terms_plain = arr(j.terms_plain);
 j.maybe_corrections = arr(j.maybe_corrections);
@@ -448,3 +447,4 @@ app.get("/", (_req, res) => res.json({ ok: true }));
 app.listen(PORT, HOST, () => {
   console.log(`yorisoi mvp listening on ${HOST}:${PORT}`);
 });
+
