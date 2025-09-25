@@ -48,31 +48,51 @@ function execFFmpeg(args) {
   });
 }
 
-// GCS compose は 32 objects/回 の制限があるため、木構造でまとめる
+/**
+ * sources を最大32個ずつ合成しながら最終的に 1 本のオブジェクトにまとめる。
+ * - 可能なら File#compose() を使用
+ * - 未対応環境では bucket.combine() にフォールバック
+ * - 最後の 1 本 → 最終ファイル には compose せず copy() を使用
+ */
 async function composeMany(objects /* File[] */, destFile /* File */) {
+  // compose を 1 回分行うヘルパー（fallback 付き）
+  const composeOnce = async (sources /* File[] */, destination /* File */) => {
+    if (typeof destination.compose === "function") {
+      await destination.compose(sources);
+    } else if (typeof destination.bucket.combine === "function") {
+      // combine(sources, destination)
+      await destination.bucket.combine(sources, destination);
+    } else {
+      throw new Error("Neither File.compose nor bucket.combine is available in this environment.");
+    }
+  };
+
   let queue = objects.slice();
   let round = 0;
+
   while (queue.length > 1) {
     const next = [];
     for (let i = 0; i < queue.length; i += 32) {
       const batch = queue.slice(i, i + 32);
-      if (batch.length === 1) {
-        next.push(batch[0]);
-        continue;
-      }
+      if (batch.length === 1) { next.push(batch[0]); continue; }
+
       const tmpName = `${destFile.name}.compose.${round}.${Math.floor(i / 32)}`;
-      const tmp = bucket.file(tmpName);
-      await tmp.compose(batch);
+      const tmp = destFile.bucket.file(tmpName);
+
+      await composeOnce(batch, tmp);
       next.push(tmp);
     }
     queue = next;
     round++;
   }
+
+  // 最後の 1 本を最終ファイル名へコピー（compose([single])は避ける）
   if (queue.length === 1 && queue[0].name !== destFile.name) {
-    await destFile.compose([queue[0]]);
-    // 中間生成物の掃除（失敗しても無視）
-    await bucket.deleteFiles({ prefix: `${destFile.name}.compose.` }).catch(() => {});
+    await queue[0].copy(destFile);
   }
+
+  // 中間ファイルの掃除（存在しなければ無視）
+  try { await destFile.bucket.deleteFiles({ prefix: `${destFile.name}.compose.` }); } catch {}
 }
 
 // ---------------- Routes ----------------
@@ -392,3 +412,4 @@ app.get("/", (_req, res) => res.json({ ok: true }));
 app.listen(PORT, HOST, () => {
   console.log(`yorisoi mvp listening on ${HOST}:${PORT}`);
 });
+
