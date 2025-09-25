@@ -279,7 +279,7 @@ app.get("/jobs/:id", async (req, res) => {
     }
 
     // ---- Gemini 要約（JSONのみで返す）----
-    const prompt = `
+const prompt = `
 あなたは「患者さんに寄り添う診察メモ」を作る日本語の編集者です。
 入力は【文字起こし】のみ。診断や断定はせず、事実ベースでやさしく整理してください。
 医療に関係しない話題（仕事/学校/家事/支払い/連絡事項 等）が含まれても、
@@ -291,17 +291,26 @@ app.get("/jobs/:id", async (req, res) => {
 【必須ルール】
 - 出力は**JSONのみ**（コードブロック不可）。
 - 不明な点は “不明” と明記。推測で断定しない。
-- 専門語はやさしい表現 + 括弧で補足（例：炎症（体の守りが働いて腫れること））。
-- 医療の話題が少ない/無い場合でも、**生活に役立つ要点とTODO**を作る（例：連絡・準備・観察点）。
+- 専門語は「やさしい言い換え」を併記（例：炎症（体の守りが働いて腫れること））。
+- 聞き違い/誤変換の疑いが高い語は、**修正候補**を別配列に列挙する（無理に作らない）。
 
-【JSONスキーマ（厳守）】
+【JSONスキーマ（厳守。既存キー＋拡張）】
 {
   "summary": "5〜8行。医療と生活の両面。挨拶や前置きは書かない。",
+  "summary_top3": ["要点を3行で。短文で。"],
   "decisions": ["決まったこと（方針/薬/検査/次回予定）。無ければ空配列。"],
   "todos_until_next": ["患者さんができる行動（時間帯や頻度を入れる）。医療/生活混在で最大7件。"],
   "ask_next_time": ["次回医師に聞くと良い具体質問（最大5件）。"],
-  "red_flags": ["受診/連絡の目安（最大3件）。数値や時間など条件を含め簡潔に。"]
+  "red_flags": ["受診/連絡の目安（最大3件）。数値や時間など条件を含め簡潔に。"],
+  "terms_plain": [ { "term":"", "easy":"", "note":"" } ],
+  "maybe_corrections": [ { "heard":"", "likely":"", "reason":"" } ]
 }
+
+【作成ガイド】
+- summary は**短文5〜8行**で、(1)今日わかったこと、(2)やること、(3)注意点 を含める。
+- summary_top3 は最重要ポイントを3行で。
+- terms_plain は、患者さんが難しいと感じそうな語（例：胃潰瘍、上部消化管内視鏡、逆流性食道炎、ピロリ菌、プロトンポンプ阻害薬 など）を優先。
+- maybe_corrections は、明らかに聞き取り違いの可能性が高いものだけ（例：「プロポンプ阻害薬」→「プロトンポンプ阻害薬」）。
 
 【文字起こし】
 <<TRANSCRIPT>>
@@ -354,18 +363,45 @@ ${transcript}
     }
 
     // ---- LINE 送信（1通目：要約 / 2通目：全文文字起こし）----
-    const toLines = (arr, label) => (arr.length ? `\n【${label}】\n- ` + arr.join("\n- ") : "");
-    const msg =
-      `■診察メモ\n` +
-      `${j.summary}\n` +
-      toLines(j.decisions, "決まったこと") +
-      toLines(j.todos_until_next, "次回までのTODO") +
-      toLines(j.ask_next_time, "次回ききたいこと") +
-      toLines(j.red_flags, "注意サイン");
-    const cleaned = msg
-      .replace(/^はい[、。]?(承知|了解)(いたしました|しました)。?\s*/i, "")
-      .replace(/^(要約|生成|まとめ)[：:]\s*/i, "");
+// ---- 整形（読みやすさ重視・セクション化）----
+const arr = (v) => Array.isArray(v) ? v : [];
+j.summary_top3 = arr(j.summary_top3);
+j.terms_plain = arr(j.terms_plain);
+j.maybe_corrections = arr(j.maybe_corrections);
 
+const bullet = (a) => a.length ? a.map(x => `- ${x}`).join("\n") : "";
+const bulletsKV = (a, fmt) => a.length ? a.map(fmt).join("\n") : "";
+
+const header = "■診察メモ";
+const top =
+  (j.summary_top3.length
+    ? `🧾 きょうの要点\n${bullet(j.summary_top3)}`
+    : `🧾 きょうの要点\n${bullet(j.summary.split(/\n+/).slice(0,3))}`);
+
+// 1通目セクション
+const secDecisions = j.decisions.length ? `\n\n【決まったこと】\n${bullet(j.decisions)}` : "";
+const secTodos     = j.todos_until_next.length ? `\n\n✅ あなたがやること\n${bullet(j.todos_until_next)}` : "";
+const secAsk       = j.ask_next_time.length ? `\n\n❓ 次回ききたいこと\n${bullet(j.ask_next_time)}` : "";
+const secFlags     = j.red_flags.length ? `\n\n🚩 こんな時は連絡/受診\n${bullet(j.red_flags)}` : "";
+const secTerms = j.terms_plain.length
+  ? `\n\n🔎 やさしい言い換え\n` + bulletsKV(j.terms_plain, t => `- ${t.term}：${t.easy}${t.note ? `（${t.note}）` : ""}`)
+  : "";
+const secCorrections = j.maybe_corrections.length
+  ? `\n\n🛠️ ことばの修正候補\n` + bulletsKV(j.maybe_corrections, c => `- 「${c.heard}」→「${c.likely}」${c.reason ? `（理由：${c.reason}）` : ""}`)
+  : "";
+
+const cleaned = [
+  header,
+  top,
+  secDecisions,
+  secTodos,
+  secFlags,      // 受診目安は上位に（重要度高）
+  secTerms,
+  secCorrections,
+  secAsk
+].filter(Boolean).join("\n");
+
+// 2通目セクション
     try {
       if (meta.userId) {
         await lineClient.pushMessage({
@@ -412,4 +448,3 @@ app.get("/", (_req, res) => res.json({ ok: true }));
 app.listen(PORT, HOST, () => {
   console.log(`yorisoi mvp listening on ${HOST}:${PORT}`);
 });
-
