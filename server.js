@@ -9,6 +9,7 @@ const { Storage } = require("@google-cloud/storage");
 const speech = require("@google-cloud/speech").v1p1beta1;
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const { execFile } = require("child_process");
+
 const PORT = process.env.PORT || 8080;
 const ORIGIN = process.env.ALLOW_ORIGIN || "*";
 const DATA_DIR = process.env.DATA_DIR || "/tmp/data";
@@ -16,6 +17,7 @@ const GCS_BUCKET = process.env.GCS_BUCKET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // CORS
@@ -33,11 +35,10 @@ const speechClient = new speech.SpeechClient();
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 const { messagingApi } = require("@line/bot-sdk");
 const lineClient = new messagingApi.MessagingApiClient({
-channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
+  channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
 });
 
-// 1) チャンクアップロード
-  // POST /sign-upload  { sessionId, userId, seq, contentType }
+// 1) チャンクアップロード（署名URL発行）
 app.post("/sign-upload", async (req, res) => {
   try {
     const { sessionId, userId, seq, contentType } = req.body || {};
@@ -48,7 +49,6 @@ app.post("/sign-upload", async (req, res) => {
     const objectPath = `sessions/${sessionId}/chunk-${String(seq).padStart(5,"0")}.${ext}`;
     const file = bucket.file(objectPath);
 
-    // V4 Signed URL（PUT）
     const [signedUrl] = await file.getSignedUrl({
       version: "v4",
       action:  "write",
@@ -84,49 +84,74 @@ app.post("/finalize", async (req, res) => {
     fs.mkdirSync(wavsDir, { recursive: true });
 
     const wavPaths = [];
-for (const f of chunks) {
-  const localSrc = path.join(workDir, path.basename(f.name));
-  await f.download({ destination: localSrc });
-  const out = path.join(wavsDir, path.basename(localSrc).replace(/\.(webm|mp4)$/,".wav"));
-  try {
-    await execFFmpeg(["-i", localSrc, "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", out]);
-    wavPaths.push(out);
-  } catch (e) {
-    console.warn("ffmpeg failed for", f.name, e?.message);
-  } finally {
-    try { fs.unlinkSync(localSrc); } catch {}
-  }
-}
-if (wavPaths.length === 0) {
-  return res.status(400).json({ ok:false, error:"all chunks invalid" });
-}
+    for (const f of chunks) {
+      const localSrc = path.join(workDir, path.basename(f.name));
+      await f.download({ destination: localSrc });
+      const out = path.join(
+        wavsDir,
+        path.basename(localSrc).replace(/\.(webm|mp4)$/,".wav")
+      );
+      try {
+        // 各チャンクを LINEAR16 16k mono に統一
+        await execFFmpeg([
+          "-i", localSrc,
+          "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+          out
+        ]);
+        wavPaths.push(out);
+      } catch (e) {
+        console.warn("ffmpeg failed for", f.name, e?.message);
+      } finally {
+        try { fs.unlinkSync(localSrc); } catch {}
+      }
+    }
+    if (wavPaths.length === 0) {
+      return res.status(400).json({ ok:false, error:"all chunks invalid" });
+    }
 
-
-    // 3) WAVを無劣化連結（ffconcat + -c copy）
+    // 3) WAVを連結（再エンコードで出力：ヘッダ不整合を回避）
     const list = path.join(workDir, "wav-list.ffconcat");
-    fs.writeFileSync(list, ["ffconcat version 1.0", ...wavPaths.map(p => `file '${p.replace(/'/g,"'\\''")}'`)].join("\n"));
+    fs.writeFileSync(
+      list,
+      ["ffconcat version 1.0", ...wavPaths.map(p => `file '${p.replace(/'/g,"'\\''")}'`)].join("\n")
+    );
     const merged = path.join(workDir, "merged.wav");
-    await execFFmpeg(["-f","concat","-safe","0","-i", list, "-c","copy", merged]);
+    await execFFmpeg([
+      "-f","concat","-safe","0","-i", list,
+      "-ar","16000","-ac","1","-c:a","pcm_s16le",
+      merged
+    ]);
 
     // 4) 1本にしたWAVをGCSへ再アップ
     const gcsName = `audio/${sessionId}.wav`;
     await bucket.upload(merged, { destination: gcsName, contentType:"audio/wav" });
     const gcsUri = `gs://${GCS_BUCKET}/${gcsName}`;
+
+    // 後始末
     for (const p of wavPaths) { try { fs.unlinkSync(p); } catch {} }
     try { fs.unlinkSync(list); } catch {}
     try { fs.unlinkSync(merged); } catch {}
 
-    // 5) 非同期STT（既存のまま）
+    // 5) 非同期STT
     const [op] = await speechClient.longRunningRecognize({
       audio: { uri: gcsUri },
-      config: { languageCode:"ja-JP", encoding:"LINEAR16", sampleRateHertz:16000, enableAutomaticPunctuation:true, model:"latest_long" },
+      config: {
+        languageCode:"ja-JP",
+        encoding:"LINEAR16",
+        sampleRateHertz:16000,
+        enableAutomaticPunctuation:true,
+        model:"latest_long"
+      },
     });
     const jobId = op.name;
 
-    // 6) jobメタ保存（MVPなら /tmp で可。将来はGCS/Firestore推奨）
+    // 6) jobメタ保存（ローカル /tmp。将来はGCS/Firestore推奨）
     const jobsDir = path.join(DATA_DIR, "jobs");
     fs.mkdirSync(jobsDir, { recursive: true });
-    fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), JSON.stringify({ sessionId, userId, gcsUri }, null, 2));
+    fs.writeFileSync(
+      path.join(jobsDir, `${jobId}.json`),
+      JSON.stringify({ sessionId, userId, gcsUri }, null, 2)
+    );
 
     res.json({ ok:true, jobId });
   } catch (e) {
@@ -137,29 +162,63 @@ if (wavPaths.length === 0) {
 
 
 // 3) ポーリング: /jobs/:id
-  app.get("/jobs/:id", async (req, res) => {
-    try {
-      const jobId = req.params.id;
+app.get("/jobs/:id", async (req, res) => {
+  try {
+    const jobId = req.params.id;
 
-    // 進捗取得（返り値は [operation] の配列）
-    const operation = await speechClient.checkLongRunningRecognizeProgress(jobId);
-    if (!operation.done) {
+    // LRO 進捗
+    const [op] = await speechClient.checkLongRunningRecognizeProgress(jobId);
+    if (!op.done) {
       return res.json({ ok: true, status: "RUNNING" });
     }
-    // 完了 → 結果（promise() で [response] ）
-    const [response] = await operation.promise();
+
+    // 完了 → 結果
+    const [response] = await op.promise();
     const transcript = (response.results || [])
       .map(r => r.alternatives?.[0]?.transcript || "")
       .join("\n")
       .trim();
 
-    // 内容が短すぎる場合はスキップ（誤検知の護身）
+    // --- 文字起こしを GCS に保存 ---
+    // sessionId / userId をメタから取得
+    const jobsDir = path.join(DATA_DIR, "jobs");
+    let meta = {};
+    try {
+      meta = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf-8"));
+    } catch {}
+    const sessionId = meta.sessionId || `unknown-${jobId}`;
+
+    try {
+      await bucket.file(`transcripts/${sessionId}.txt`).save(transcript || "", {
+        resumable: false,
+        contentType: "text/plain; charset=utf-8",
+        metadata: { cacheControl: "no-store" }
+      });
+    } catch (e) {
+      console.error("save transcript failed:", e?.message);
+    }
+
+    // 内容が短すぎる場合はスキップ
     if (!transcript || transcript.replace(/\s/g, "").length < 15) {
+      // LINEにも transcript を送る（テストしやすく）
+      try {
+        if (meta.userId) {
+          await lineClient.pushMessage({
+            to: meta.userId,
+            messages: [
+              { type:"text", text: "■診察メモ\n（短い録音のためメモは作成しませんでした）" },
+              { type:"text", text: `＜文字起こし全文＞\n${(transcript || "").slice(0,4000)}` }
+            ]
+          });
+        }
+      } catch (e) {
+        console.error("LINE push (short) failed:", e?.statusCode, e?.message);
+      }
       return res.json({ ok: true, status: "DONE", transcript, summary: "（短い録音のためメモは作成しませんでした）" });
     }
 
-    // ---- Gemini で要約：JSONのみ、AI前置き禁止、付き添い者視点 ----
-const prompt = `
+    // ---- Gemini で要約（JSON固定）----
+    const prompt = `
 あなたは「患者さんに寄り添う診察メモ」を作る日本語の編集者です。
 入力は【文字起こし】のみ。診断や断定はせず、事実ベースでやさしく整理してください。
 医療に関係しない話題（仕事/学校/家事/支払い/連絡事項 等）が含まれても、
@@ -221,7 +280,18 @@ ${transcript}
     j.red_flags = arr(j.red_flags);
     j.summary = (j.summary || "").toString().trim();
 
-    // LINE用に整形（AI前置きの掃除も保険で）
+    // --- Gemini要約を GCS 保存 ---
+    try {
+      await bucket.file(`summaries/${sessionId}.json`).save(JSON.stringify(j, null, 2), {
+        resumable: false,
+        contentType: "application/json",
+        metadata: { cacheControl: "no-store" }
+      });
+    } catch (e) {
+      console.error("save summary failed:", e?.message);
+    }
+
+    // LINE用メッセージ（2通構成）
     const toLines = (arr, label) => arr.length ? `\n【${label}】\n- ` + arr.join("\n- ") : "";
     const msg =
       `■診察メモ\n` +
@@ -234,20 +304,28 @@ ${transcript}
       .replace(/^はい[、。]?(承知|了解)(いたしました|しました)。?\s*/i, "")
       .replace(/^(要約|生成|まとめ)[：:]\s*/i, "");
 
-    // LINE Push
-    const jobsDir = path.join(DATA_DIR, "jobs");
-    const meta = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf-8"));
-  try {
-   await lineClient.pushMessage({ to: meta.userId, messages:[{ type:"text", text: cleaned.slice(0,4999) }] });
- } catch (e) {
-   console.error("LINE push failed:", e?.statusCode, e?.message);
- }
+    // LINE Push（要約 + 文字起こし全文）
+    try {
+      if (meta.userId) {
+        await lineClient.pushMessage({
+          to: meta.userId,
+          messages: [
+            { type:"text", text: cleaned.slice(0,4000) },
+            { type:"text", text: `＜文字起こし全文＞\n${transcript.slice(0,4000)}` }
+          ]
+        });
+      }
+    } catch (e) {
+      console.error("LINE push failed:", e?.statusCode, e?.message);
+    }
+
     return res.json({ ok: true, status: "DONE", transcript, summary: cleaned });
-   } catch (e) {
-     console.error("[/jobs] error", e);
-     return res.status(500).json({ ok: false, error: String(e) });
-   }
- });
+
+  } catch (e) {
+    console.error("[/jobs] error", e);
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 
 // LINE Webhook（必要なら返信もできる）
 app.post("/line/webhook", express.json(), async (req, res) => {
@@ -270,7 +348,7 @@ app.post("/line/webhook", express.json(), async (req, res) => {
 // どこからでも受ける
 const HOST = '0.0.0.0';
 
-// ヘルス用（Cloud Run は / で見ることが多い）
+// ヘルス用
 app.get('/', (_, res) => res.json({ ok: true }));
 
 app.listen(PORT, HOST, () => {
@@ -285,8 +363,4 @@ function execFFmpeg(args) {
       resolve();
     });
   });
-
 }
-
-
-
