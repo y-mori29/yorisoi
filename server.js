@@ -159,8 +159,6 @@ if (wavPaths.length === 0) {
     }
 
     // ---- Gemini で要約：JSONのみ、AI前置き禁止、付き添い者視点 ----
-    const prompt = `
-// ---- Gemini で要約：患者さんに寄り添う長めの要約（JSON固定）----
 const prompt = `
 あなたは「患者さんに寄り添う診察メモ」を作る日本語の編集者です。
 入力は【文字起こし】のみ。診断や断定はせず、事実ベースでやさしく整理してください。
@@ -289,5 +287,6 @@ function execFFmpeg(args) {
   });
 
 }
+
 
 
