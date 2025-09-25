@@ -294,10 +294,10 @@ const prompt = `
 - 専門語は「やさしい言い換え」を併記（例：炎症（体の守りが働いて腫れること））。
 - 聞き違い/誤変換の疑いが高い語は、**修正候補**を別配列に列挙する（無理に作らない）。
 
-【JSONスキーマ（厳守。既存キー＋拡張）】
+【JSONスキーマ（厳守）】
 {
   "summary": "5〜8行。医療と生活の両面。挨拶や前置きは書かない。",
-  "summary_top3": ["要点を3行で。短文で。"],
+  "summary_top3": ["要点を**3行**で（会話の引用ではなく、短い要約文）。"],
   "decisions": ["決まったこと（方針/薬/検査/次回予定）。無ければ空配列。"],
   "todos_until_next": ["患者さんができる行動（時間帯や頻度を入れる）。医療/生活混在で最大7件。"],
   "ask_next_time": ["次回医師に聞くと良い具体質問（最大5件）。"],
@@ -320,8 +320,14 @@ ${transcript}
 
     const model = genAI.getGenerativeModel({
       model: "gemini-2.5-flash-lite",
-      generationConfig: { temperature: 0.3, topP: 0.8, topK: 40, maxOutputTokens: 1024 },
+      generationConfig: {
+        temperature: 0.2,           // 安定寄り
+        topP: 0.9,
+        maxOutputTokens: 1800,      // 出力量を確保
+        responseMimeType: "application/json" // JSONを強制
+      },
     });
+    
     const gem = await model.generateContent(prompt);
     let raw = (gem.response && gem.response.text && gem.response.text()) || "";
 
@@ -447,4 +453,5 @@ app.get("/", (_req, res) => res.json({ ok: true }));
 app.listen(PORT, HOST, () => {
   console.log(`yorisoi mvp listening on ${HOST}:${PORT}`);
 });
+
 
