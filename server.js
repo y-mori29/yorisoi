@@ -16,7 +16,6 @@ const GCS_BUCKET = process.env.GCS_BUCKET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // CORS
@@ -290,4 +289,5 @@ function execFFmpeg(args) {
   });
 
 }
+
 
