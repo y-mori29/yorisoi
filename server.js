@@ -282,35 +282,28 @@ app.get("/jobs/:id", async (req, res) => {
 const prompt = `
 あなたは「患者さんに寄り添う診察メモ」を作る日本語の編集者です。
 入力は【文字起こし】のみ。診断や断定はせず、事実ベースでやさしく整理してください。
-医療に関係しない話題（仕事/学校/家事/支払い/連絡事項 等）が含まれても、
-患者さんの生活に役立つ形で**必ず**要約・TODOに反映します。
+医療に関係しない話題（仕事/学校/家事/連絡など）も、患者さんの生活に役立つ形で要約・TODOに反映します。
 
-【口調】
-- 落ち着いた丁寧体（〜です／ます）。過剰敬語や前置きは不要。
+【口調・方針】
+- 落ち着いた丁寧体（〜です／ます）。前置きやAI的断り書きは不要。
+- 会話の“引用”は禁止（「こんにちは」「横になってください」などは要点に入れない）。
+- **誤変換・表記ゆれの“静かな正規化”**：専門用語や薬剤名などは一般的な正式名称に直して記述（例：プロポンプ阻害薬→プロトンポンプ阻害薬）。訂正リストは出さない。
 
-【必須ルール】
-- 出力は**JSONのみ**（コードブロック不可）。
-- 不明な点は “不明” と明記。推測で断定しない。
-- 専門語は「やさしい言い換え」を併記（例：炎症（体の守りが働いて腫れること））。
-- 聞き違い/誤変換の疑いが高い語は、**修正候補**を別配列に列挙する（無理に作らない）。
-
-【JSONスキーマ（厳守）】
+【JSONのみで出力（コードブロック不可）】
 {
-  "summary": "5〜8行。医療と生活の両面。挨拶や前置きは書かない。",
-  "summary_top3": ["要点を**3行**で（会話の引用ではなく、短い要約文）。"],
-  "decisions": ["決まったこと（方針/薬/検査/次回予定）。無ければ空配列。"],
-  "todos_until_next": ["患者さんができる行動（時間帯や頻度を入れる）。医療/生活混在で最大7件。"],
-  "ask_next_time": ["次回医師に聞くと良い具体質問（最大5件）。"],
-  "red_flags": ["受診/連絡の目安（最大3件）。数値や時間など条件を含め簡潔に。"],
-  "terms_plain": [ { "term":"", "easy":"", "note":"" } ],
-  "maybe_corrections": [ { "heard":"", "likely":"", "reason":"" } ]
+  "summary_top3": ["最重要ポイント3行（各40字以内・引用不可）"],
+  "decisions": ["決まったこと（方針/薬/検査/次回）。最大3件、各40字以内"],
+  "todos_until_next": ["患者さんができる行動（いつ/どれくらい/理由）。最大5件、各40字以内"],
+  "red_flags": ["受診/連絡の目安。2〜3件、各40字以内、数値や時間を入れる"],
+  "ask_next_time": ["次回医師へ確認。最大3件、各40字以内"],
+  "terms_plain": [ { "term":"", "easy":"" } ]  // 医療の専門用語や難語のやさしい言い換え。最大5件、easyは40字以内
 }
 
 【作成ガイド】
-- summary は**短文5〜8行**で、(1)今日わかったこと、(2)やること、(3)注意点 を含める。
-- summary_top3 は最重要ポイントを3行で。
-- terms_plain は、患者さんが難しいと感じそうな語（例：胃潰瘍、上部消化管内視鏡、逆流性食道炎、ピロリ菌、プロトンポンプ阻害薬 など）を優先。
-- maybe_corrections は、明らかに聞き取り違いの可能性が高いものだけ（例：「プロポンプ阻害薬」→「プロトンポンプ阻害薬」）。
+- summary_top3 は必ず3行。会話文の直写は不可、短文の要約にする。
+- decisions/todos/red_flags/ask_next_time/terms_plain は上限件数を超えないこと。
+- 文字起こしに誤りが疑われる語は、一般的な医学用語に直して記述（訂正一覧は出さない）。
+- 迷う場合は “不明” とし、推測で断定しない。
 
 【文字起こし】
 <<TRANSCRIPT>>
@@ -371,10 +364,21 @@ ${transcript}
     // ---- LINE 送信（1通目：要約 / 2通目：全文文字起こし）----
 // ---- 整形（読みやすさ重視・セクション化）----
 j.summary_top3 = arr(j.summary_top3);
-j.terms_plain = arr(j.terms_plain);
-j.maybe_corrections = arr(j.maybe_corrections);
+j.terms_plain   = arr(j.terms_plain);
 
-const bullet = (a) => a.length ? a.map(x => `- ${x}`).join("\n") : "";
+// 件数と文字数を上限管理
+const cap = (a, n) => arr(a).slice(0, n);
+const short = (s, n=40) => (s||"").length>n ? (s.slice(0,n-1)+"…") : (s||"");
+j.summary_top3     = cap(j.summary_top3, 3).map(x => short(x, 40));
+j.decisions        = cap(j.decisions, 3).map(x => short(x, 40));
+j.todos_until_next = cap(j.todos_until_next, 5).map(x => short(x, 40));
+// red_flags は2〜3件に調整
+const rf = cap(j.red_flags, 3).map(x => short(x, 40));
+j.red_flags = rf.length >= 2 ? rf : rf; // 足りない時はそのまま
+j.ask_next_time    = cap(j.ask_next_time, 3).map(x => short(x, 40));
+j.terms_plain      = cap(j.terms_plain, 3).map(t => ({ term: short(t.term, 24), easy: short(t.easy, 40) }));
+
+const bullet = (a) => a.length ? a.map(x => `・ ${x}`).join("\n") : "";
 const bulletsKV = (a, fmt) => a.length ? a.map(fmt).join("\n") : "";
 
 const header = "■診察メモ";
@@ -389,10 +393,7 @@ const secTodos     = j.todos_until_next.length ? `\n\n✅ あなたがやるこ�
 const secAsk       = j.ask_next_time.length ? `\n\n❓ 次回ききたいこと\n${bullet(j.ask_next_time)}` : "";
 const secFlags     = j.red_flags.length ? `\n\n🚩 こんな時は連絡/受診\n${bullet(j.red_flags)}` : "";
 const secTerms = j.terms_plain.length
-  ? `\n\n🔎 やさしい言い換え\n` + bulletsKV(j.terms_plain, t => `- ${t.term}：${t.easy}${t.note ? `（${t.note}）` : ""}`)
-  : "";
-const secCorrections = j.maybe_corrections.length
-  ? `\n\n🛠️ ことばの修正候補\n` + bulletsKV(j.maybe_corrections, c => `- 「${c.heard}」→「${c.likely}」${c.reason ? `（理由：${c.reason}）` : ""}`)
+  ? `\n\n🔎 やさしい言い換え\n` + bulletsKV(j.terms_plain, t => `・ ${t.term}：${t.easy}`)
   : "";
 
 const cleaned = [
@@ -402,7 +403,6 @@ const cleaned = [
   secTodos,
   secFlags,      // 受診目安は上位に（重要度高）
   secTerms,
-  secCorrections,
   secAsk
 ].filter(Boolean).join("\n");
 
@@ -453,5 +453,6 @@ app.get("/", (_req, res) => res.json({ ok: true }));
 app.listen(PORT, HOST, () => {
   console.log(`yorisoi mvp listening on ${HOST}:${PORT}`);
 });
+
 
 
