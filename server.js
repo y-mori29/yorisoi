@@ -48,47 +48,72 @@ function execFFmpeg(args) {
     });
   });
 }
+async function gcsExists(file) {
+  const [exists] = await file.exists();
+  return !!exists;
+}
+async function acquireLock(file, payloadObj) {
+  try {
+    await file.save(JSON.stringify(payloadObj || { at: new Date().toISOString() }, null, 2), {
+      resumable: false,
+      contentType: "application/json",
+      ifGenerationMatch: 0, // 既存なら412
+    });
+    return true;
+  } catch (e) {
+    if (e.code === 412) return false;
+    throw e;
+  }
+}
+function parseJsonLoose(s) {
+  if (!s) throw new Error("empty");
+  let t = String(s).trim();
+  // コードフェンス除去
+  t = t.replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  // 先頭{〜末尾} を抽出
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    t = t.slice(start, end + 1);
+  }
+  return JSON.parse(t);
+}
+function shortText(s, n = 40) {
+  const str = (s || "").trim();
+  return str.length > n ? str.slice(0, n - 1) + "…" : str;
+}
 
 /**
- * sources を最大32個ずつ合成しながら最終的に 1 本のオブジェクトにまとめる。
- * - 可能なら File#compose() を使用
- * - 未対応環境では bucket.combine() にフォールバック
- * - 最後の 1 本 → 最終ファイル には compose せず copy() を使用
+ * sources を最大32個ずつ合成しながら最終的に 1 本にまとめる
  */
 async function composeMany(objects /* File[] */, destFile /* File */) {
-  const composeOnce = async (sources /* File[] */, destination /* File */) => {
+  const composeOnce = async (sources, destination) => {
     if (typeof destination.compose === "function") {
       await destination.compose(sources);
     } else if (typeof destination.bucket.combine === "function") {
       await destination.bucket.combine(sources, destination);
     } else {
-      throw new Error("Neither File.compose nor bucket.combine is available in this environment.");
+      throw new Error("Neither File.compose nor bucket.combine is available.");
     }
   };
 
   let queue = objects.slice();
   let round = 0;
-
   while (queue.length > 1) {
     const next = [];
     for (let i = 0; i < queue.length; i += 32) {
       const batch = queue.slice(i, i + 32);
       if (batch.length === 1) { next.push(batch[0]); continue; }
-
-      const tmpName = `${destFile.name}.compose.${round}.${Math.floor(i / 32)}`;
-      const tmp = destFile.bucket.file(tmpName);
-
+      const tmp = destFile.bucket.file(`${destFile.name}.compose.${round}.${Math.floor(i/32)}`);
       await composeOnce(batch, tmp);
       next.push(tmp);
     }
     queue = next;
     round++;
   }
-
   if (queue.length === 1 && queue[0].name !== destFile.name) {
     await queue[0].copy(destFile);
   }
-
   try { await destFile.bucket.deleteFiles({ prefix: `${destFile.name}.compose.` }); } catch {}
 }
 
@@ -120,12 +145,24 @@ app.post("/sign-upload", async (req, res) => {
   }
 });
 
-// 2) 結合＋STTジョブ開始
+// 2) 結合＋STTジョブ開始（セッション冪等化）
 app.post("/finalize", async (req, res) => {
   try {
     const { sessionId, userId } = req.body;
     if (!sessionId || !userId)
       return res.status(400).json({ ok: false, error: "sessionId/userId required" });
+
+    // セッション冪等化（既にjobがあればそれを返す）
+    const sessionMetaFile = bucket.file(`jobs-meta/by-session/${sessionId}.json`);
+    if (await gcsExists(sessionMetaFile)) {
+      try {
+        const [buf] = await sessionMetaFile.download();
+        const prev = JSON.parse(buf.toString("utf-8"));
+        if (prev && prev.jobId) {
+          return res.json({ ok: true, jobId: prev.jobId });
+        }
+      } catch {}
+    }
 
     // チャンク一覧
     const prefix = `sessions/${sessionId}/`;
@@ -135,12 +172,12 @@ app.post("/finalize", async (req, res) => {
       .sort((a, b) => a.name.localeCompare(b.name));
     if (chunks.length === 0) return res.status(400).json({ ok: false, error: "no chunks in GCS" });
 
-    // 1) まず GCS compose で一本化（fMP4/WebMに強い）
+    // GCS compose → 1本化
     const ext = chunks[0].name.endsWith(".mp4") ? "mp4" : "webm";
     const assembledObj = bucket.file(`sessions/${sessionId}/assembled.${ext}`);
     await composeMany(chunks.map((c) => bucket.file(c.name)), assembledObj);
 
-    // 2) ffmpeg で一発WAV（16k/mono/LINEAR16）に変換
+    // ffmpegでWAV化
     const workDir = path.join(DATA_DIR, "sessions", sessionId);
     fs.mkdirSync(workDir, { recursive: true });
     const localAssembled = path.join(workDir, `assembled.${ext}`);
@@ -149,16 +186,15 @@ app.post("/finalize", async (req, res) => {
     await assembledObj.download({ destination: localAssembled });
     await execFFmpeg(["-i", localAssembled, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", mergedWav]);
 
-    // 3) GCS へアップ（STT入力）
+    // GCSへアップ（STT入力）
     const gcsName = `audio/${sessionId}.wav`;
     await bucket.upload(mergedWav, { destination: gcsName, contentType: "audio/wav" });
     const gcsUri = `gs://${GCS_BUCKET}/${gcsName}`;
 
-    // 後片付け
     try { fs.unlinkSync(localAssembled); } catch {}
     try { fs.unlinkSync(mergedWav); } catch {}
 
-    // 4) 非同期STT
+    // STT起動
     const [op] = await speechClient.longRunningRecognize({
       audio: { uri: gcsUri },
       config: {
@@ -169,15 +205,38 @@ app.post("/finalize", async (req, res) => {
         model: "latest_long",
       },
     });
-    const jobId = op.name;
+    let jobId = op.name;
 
-    // 5) /tmp にジョブメタ保存（MVP）
+    // GCSにジョブメタを原子的に保存（同時起動レース対策）
+    try {
+      await sessionMetaFile.save(JSON.stringify({ sessionId, userId, gcsUri, jobId }, null, 2), {
+        resumable: false,
+        contentType: "application/json",
+        ifGenerationMatch: 0,
+      });
+    } catch (e) {
+      if (e.code === 412) {
+        // 他インスタンスが先に保存 -> そのjobIdを返す
+        const [buf] = await sessionMetaFile.download();
+        const prev = JSON.parse(buf.toString("utf-8"));
+        jobId = prev.jobId || jobId;
+      } else {
+        throw e;
+      }
+    }
+
+    // /tmp にも（互換）
     const jobsDir = path.join(DATA_DIR, "jobs");
     fs.mkdirSync(jobsDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(jobsDir, `${jobId}.json`),
-      JSON.stringify({ sessionId, userId, gcsUri }, null, 2)
-    );
+    fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), JSON.stringify({ sessionId, userId, gcsUri }, null, 2));
+
+    // jobId基準のメタ（/jobsで引けるように）
+    try {
+      await bucket.file(`jobs-meta/by-job/${jobId}.json`).save(
+        JSON.stringify({ sessionId, userId, gcsUri, jobId }, null, 2),
+        { resumable: false, contentType: "application/json", metadata:{cacheControl:"no-store"} }
+      );
+    } catch {}
 
     res.json({ ok: true, jobId });
   } catch (e) {
@@ -192,6 +251,12 @@ app.get("/jobs/:id", async (req, res) => {
   try {
     const jobId = req.params.id;
 
+    // 既に完了配信済みなら即終了（早期return）
+    const doneFile = bucket.file(`deliveries/${jobId}.done`);
+    if (await gcsExists(doneFile)) {
+      return res.json({ ok: true, status: "DONE" });
+    }
+
     // ▼ SDK差異に両対応（配列でも単体でも）
     const progress = await speechClient.checkLongRunningRecognizeProgress(jobId);
     const op = Array.isArray(progress) ? progress[0] : progress;
@@ -204,7 +269,14 @@ app.get("/jobs/:id", async (req, res) => {
       return res.json({ ok: true, status: "RUNNING" });
     }
 
-    // ▼ 結果抽出も両対応
+    // 配信ロック（重複防止）: 取得できなければ他が処理中なので早期return
+    const lockFile = bucket.file(`deliveries/${jobId}.lock`);
+    const locked = await acquireLock(lockFile, { jobId, at: new Date().toISOString() });
+    if (!locked) {
+      return res.json({ ok: true, status: "DONE" });
+    }
+
+    // ▼ 結果抽出（op.promise() 互換）
     let response;
     if (typeof op.promise === "function") {
       const result = await op.promise();
@@ -230,15 +302,20 @@ app.get("/jobs/:id", async (req, res) => {
       .join("\n")
       .trim();
 
-    // メタ読込（sessionId / userId）
-    const jobsDir = path.join(DATA_DIR, "jobs");
+    // メタ：GCS by-job を優先、なければ /tmp
     let meta = {};
     try {
-      meta = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf-8"));
-    } catch {}
+      const [buf] = await bucket.file(`jobs-meta/by-job/${jobId}.json`).download();
+      meta = JSON.parse(buf.toString("utf-8"));
+    } catch {
+      try {
+        const jobsDir = path.join(DATA_DIR, "jobs");
+        meta = JSON.parse(fs.readFileSync(path.join(jobsDir, `${jobId}.json`), "utf-8"));
+      } catch {}
+    }
     const sessionId = meta.sessionId || `unknown-${jobId}`;
 
-    // ---- transcript を GCS 保存 ----
+    // transcript を GCS 保存
     try {
       await bucket.file(`transcripts/${sessionId}.txt`).save(transcript || "", {
         resumable: false,
@@ -249,7 +326,7 @@ app.get("/jobs/:id", async (req, res) => {
       console.error("save transcript failed:", e?.message);
     }
 
-    // 短すぎるときは軽い通知のみ（1通）
+    // 短すぎる→軽い通知のみ
     if (!transcript || transcript.replace(/\s/g, "").length < 15) {
       try {
         if (meta.userId) {
@@ -260,13 +337,12 @@ app.get("/jobs/:id", async (req, res) => {
         }
       } catch (e) {
         console.error("LINE push (short) failed:", e?.statusCode, e?.message);
+      } finally {
+        // done マーク & lock解放
+        try { await doneFile.save(JSON.stringify({ short: true, at: new Date().toISOString() }, null, 2), { resumable:false, contentType:"application/json" }); } catch {}
+        try { await lockFile.delete(); } catch {}
       }
-      return res.json({
-        ok: true,
-        status: "DONE",
-        transcript,
-        summary: "（短い録音のためメモは作成しませんでした）",
-      });
+      return res.json({ ok: true, status: "DONE", transcript });
     }
 
     // ---- LLM（短い要約 / 詳細要約）を並列実行 ----
@@ -287,7 +363,7 @@ app.get("/jobs/:id", async (req, res) => {
   "todos_until_next": ["患者さんができる行動（いつ/どれくらい/理由）。最大5件、各40字以内"],
   "red_flags": ["受診/連絡の目安。2〜3件、各40字以内、数値や時間を入れる"],
   "ask_next_time": ["次回医師へ確認。最大3件、各40字以内"],
-  "terms_plain": [ { "term":"", "easy":"" } ]  // 医療の専門用語や難語のやさしい言い換え。最大5件、easyは40字以内
+  "terms_plain": [ { "term":"", "easy":"" } ]
 }
 
 【文字起こし】
@@ -329,19 +405,16 @@ ${transcript}
       generationConfig: { temperature: 0.2, topP: 0.9, maxOutputTokens: 2800, responseMimeType: "application/json" },
     });
 
-    const shortGen = shortModel.generateContent(shortPrompt);
-    const detailGen = detailModel.generateContent(detailPrompt);
-
-    const [shortResp, detailResp] = await Promise.all([shortGen, detailGen]);
+    const [shortResp, detailResp] = await Promise.all([
+      shortModel.generateContent(shortPrompt),
+      detailModel.generateContent(detailPrompt),
+    ]);
     console.log(`[jobs] llm parallel ms=${Date.now()-t0}`);
 
     // ---- 短い要約のパース ----
     let j;
     try {
-      const raw = shortResp.response.text();
-      const m = raw.match(/```json([\s\S]*?)```/i);
-      const jsonText = (m ? m[1] : raw).trim();
-      j = JSON.parse(jsonText);
+      j = parseJsonLoose(shortResp.response.text());
     } catch (e) {
       console.error("short JSON parse failed:", e?.message);
       j = { summary_top3: [], decisions: [], todos_until_next: [], ask_next_time: [], red_flags: [], terms_plain: [] };
@@ -357,9 +430,7 @@ ${transcript}
     // ---- 詳細要約のパース ----
     let full = {};
     try {
-      const dText = detailResp.response.text();
-      const dm = dText.match(/\{[\s\S]*\}$/);
-      full = JSON.parse(dm ? dm[0] : dText);
+      full = parseJsonLoose(detailResp.response.text());
     } catch (e) {
       console.error("detail JSON parse failed:", e?.message);
       full = { summary: "", summary_top3: j.summary_top3, decisions: j.decisions, todos_until_next: j.todos_until_next, ask_next_time: j.ask_next_time, red_flags: j.red_flags, terms_plain: j.terms_plain, topic_blocks: [], timeline: [] };
@@ -380,16 +451,15 @@ ${transcript}
       expires: Date.now() + DETAIL_URL_TTL_DAYS*24*60*60*1000
     });
 
-    // ---- LINE整形（短く見やすく）----
+    // ---- LINE整形（短く見やすく・1通）----
     const cap = (a, n) => arr(a).slice(0, n);
-    const short = (s, n=40) => (s||"").length>n ? (s.slice(0,n-1)+"…") : (s||"");
-    j.summary_top3     = cap(j.summary_top3, 3).map(x => short(x, 40));
-    j.decisions        = cap(j.decisions, 3).map(x => short(x, 40));
-    j.todos_until_next = cap(j.todos_until_next, 5).map(x => short(x, 40));
-    const rf = cap(j.red_flags, 3).map(x => short(x, 40));
-    j.red_flags = rf.length >= 2 ? rf : rf;
-    j.ask_next_time    = cap(j.ask_next_time, 3).map(x => short(x, 40));
-    j.terms_plain      = cap(j.terms_plain, 3).map(t => ({ term: short(t.term, 24), easy: short(t.easy, 40) }));
+    j.summary_top3     = cap(j.summary_top3, 3).map(x => shortText(x, 40));
+    j.decisions        = cap(j.decisions, 3).map(x => shortText(x, 40));
+    j.todos_until_next = cap(j.todos_until_next, 5).map(x => shortText(x, 40));
+    const rf = cap(j.red_flags, 3).map(x => shortText(x, 40));
+    j.red_flags        = rf;
+    j.ask_next_time    = cap(j.ask_next_time, 3).map(x => shortText(x, 40));
+    j.terms_plain      = cap(j.terms_plain, 3).map(t => ({ term: shortText(t.term, 24), easy: shortText(t.easy, 40) }));
 
     const bullet = (a) => a.length ? a.map(x => `・ ${x}`).join("\n") : "";
     const bulletsKV = (a, fmt) => a.length ? a.map(fmt).join("\n") : "";
@@ -398,7 +468,7 @@ ${transcript}
     const top =
       (j.summary_top3.length
         ? `🧾 きょうの要点\n${bullet(j.summary_top3)}`
-        : `🧾 きょうの要点\n${bullet([].slice.call((j.summary||"").split(/\n+/),0,3))}`);
+        : `🧾 きょうの要点\n${bullet((full.summary || "").split(/\n+/).slice(0,3))}`);
 
     const secDecisions = j.decisions.length ? `\n\n【決まったこと】\n${bullet(j.decisions)}` : "";
     const secTodos     = j.todos_until_next.length ? `\n\n✅ あなたがやること\n${bullet(j.todos_until_next)}` : "";
@@ -420,41 +490,28 @@ ${transcript}
 
     cleaned += `\n\n🔗 詳細を見る（${DETAIL_URL_TTL_DAYS}日有効）\n${detailUrl}`;
 
-    // ---- 冪等化（重複送信防止）：GCSマーカーを ifGenerationMatch:0 で作成 ----
-    const deliveryMarker = bucket.file(`deliveries/${jobId}.done`);
-    let acquired = false;
+    // ---- 配信done マーク（先にdoneを書いてもOKだが、送信後に書く）----
     try {
-      await deliveryMarker.save(
-        JSON.stringify({ pushedAt: new Date().toISOString(), sessionId, detailUrl }, null, 2),
-        {
-          resumable: false,
-          contentType: "application/json",
-          ifGenerationMatch: 0, // 既存なら412
-        }
-      );
-      acquired = true;
-    } catch (e) {
-      if (e.code === 412) {
-        // 既に他インスタンスが送信済み
-        return res.json({ ok: true, status: "DONE", transcript });
-      }
-      throw e;
-    }
-
-    // ---- LINE送信（1通のみ）----
-    if (acquired && meta.userId) {
-      try {
+      if (meta.userId) {
         await lineClient.pushMessage({
           to: meta.userId,
           messages: [{ type: "text", text: cleaned.slice(0, 4999) }],
         });
-      } catch (e) {
-        console.error("LINE push failed:", e?.statusCode, e?.message);
       }
+    } catch (e) {
+      console.error("LINE push failed:", e?.statusCode, e?.message);
+    } finally {
+      try {
+        await doneFile.save(JSON.stringify({ pushedAt: new Date().toISOString(), sessionId, detailUrl }, null, 2), {
+          resumable: false,
+          contentType: "application/json",
+        });
+      } catch {}
+      try { await lockFile.delete(); } catch {}
     }
 
     console.log(`[jobs] total ms=${Date.now()-t0}`);
-    return res.json({ ok: true, status: "DONE", transcript, summary: cleaned });
+    return res.json({ ok: true, status: "DONE", transcript });
   } catch (e) {
     console.error("[/jobs] error", e);
     return res.status(500).json({ ok: false, error: String(e) });
@@ -491,7 +548,6 @@ app.listen(PORT, HOST, () => {
 function escapeHtml(s="") {
   return (s || "").replace(/[&<>"']/g, m => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));
 }
-
 function buildDetailHtml(full, transcript) {
   const li = (t) => t ? `<li>${escapeHtml(t)}</li>` : "";
   const ul = (arr) => (arr && arr.length) ? `<ul>${arr.map(li).join("")}</ul>` : "";
