@@ -17,6 +17,7 @@ const GCS_BUCKET = process.env.GCS_BUCKET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 // const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET; // 未使用
+const DETAIL_URL_TTL_DAYS = Number(process.env.DETAIL_URL_TTL_DAYS || "7"); // 署名URLの有効日数
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -55,12 +56,10 @@ function execFFmpeg(args) {
  * - 最後の 1 本 → 最終ファイル には compose せず copy() を使用
  */
 async function composeMany(objects /* File[] */, destFile /* File */) {
-  // compose を 1 回分行うヘルパー（fallback 付き）
   const composeOnce = async (sources /* File[] */, destination /* File */) => {
     if (typeof destination.compose === "function") {
       await destination.compose(sources);
     } else if (typeof destination.bucket.combine === "function") {
-      // combine(sources, destination)
       await destination.bucket.combine(sources, destination);
     } else {
       throw new Error("Neither File.compose nor bucket.combine is available in this environment.");
@@ -86,12 +85,10 @@ async function composeMany(objects /* File[] */, destFile /* File */) {
     round++;
   }
 
-  // 最後の 1 本を最終ファイル名へコピー（compose([single])は避ける）
   if (queue.length === 1 && queue[0].name !== destFile.name) {
     await queue[0].copy(destFile);
   }
 
-  // 中間ファイルの掃除（存在しなければ無視）
   try { await destFile.bucket.deleteFiles({ prefix: `${destFile.name}.compose.` }); } catch {}
 }
 
@@ -158,12 +155,8 @@ app.post("/finalize", async (req, res) => {
     const gcsUri = `gs://${GCS_BUCKET}/${gcsName}`;
 
     // 後片付け
-    try {
-      fs.unlinkSync(localAssembled);
-    } catch {}
-    try {
-      fs.unlinkSync(mergedWav);
-    } catch {}
+    try { fs.unlinkSync(localAssembled); } catch {}
+    try { fs.unlinkSync(mergedWav); } catch {}
 
     // 4) 非同期STT
     const [op] = await speechClient.longRunningRecognize({
@@ -255,16 +248,13 @@ app.get("/jobs/:id", async (req, res) => {
       console.error("save transcript failed:", e?.message);
     }
 
-    // 短すぎるときは要約スキップ（ただしLINEで全文は送る）
+    // 短すぎるときは軽い通知のみ（1通）
     if (!transcript || transcript.replace(/\s/g, "").length < 15) {
       try {
         if (meta.userId) {
           await lineClient.pushMessage({
             to: meta.userId,
-            messages: [
-              { type: "text", text: "■診察メモ\n（短い内容のためメモは作成しませんでした）" },
-              { type: "text", text: `＜文字起こし全文＞\n${(transcript || "").slice(0, 4000)}` },
-            ],
+            messages: [{ type: "text", text: "■診察メモ\n（短い内容のためメモは作成しませんでした）" }],
           });
         }
       } catch (e) {
@@ -278,7 +268,7 @@ app.get("/jobs/:id", async (req, res) => {
       });
     }
 
-    // ---- Gemini 要約（JSONのみで返す）----
+    // ---- 1) LINE用・短い要約（JSON）----
 const prompt = `
 あなたは「患者さんに寄り添う診察メモ」を作る日本語の編集者です。
 入力は【文字起こし】のみ。診断や断定はせず、事実ベースでやさしく整理してください。
@@ -314,17 +304,15 @@ ${transcript}
     const model = genAI.getGenerativeModel({
       model: "gemini-2.5-flash-lite",
       generationConfig: {
-        temperature: 0.2,           // 安定寄り
+        temperature: 0.2,
         topP: 0.9,
-        maxOutputTokens: 1800,      // 出力量を確保
-        responseMimeType: "application/json" // JSONを強制
+        maxOutputTokens: 1800,
+        responseMimeType: "application/json"
       },
     });
-    
+
     const gem = await model.generateContent(prompt);
     let raw = (gem.response && gem.response.text && gem.response.text()) || "";
-
-    // コードブロックで返る場合に備える
     const jsonText = (() => {
       const m = raw.match(/```json([\s\S]*?)```/i);
       return (m ? m[1] : raw).trim();
@@ -349,72 +337,134 @@ ${transcript}
     j.ask_next_time = arr(j.ask_next_time);
     j.red_flags = arr(j.red_flags);
     j.summary = (j.summary || "").toString().trim();
+    j.summary_top3 = arr(j.summary_top3);
+    j.terms_plain = arr(j.terms_plain);
 
-    // ---- 要約を GCS 保存 ----
+    // ---- 2) 詳細用・濃い要約（JSON）----
+    const detailPrompt = `
+あなたは患者さんに寄り添う編集者です。以下の文字起こしから、詳しい診察メモをJSONで作成します。
+会話の引用は避けて要約文で書き、誤変換や表記ゆれは**静かに一般的な正式名称へ正規化**してください。
+（例：プロポンプ阻害薬→プロトンポンプ阻害薬、ヘリコバクター ピロリ→ヘリコバクター・ピロリ菌）
+
+【JSONのみで出力（コードブロック不可）】
+{
+  "summary": "6〜12行の概要",
+  "summary_top3": ["最重要ポイント3行"],
+  "decisions": ["できるだけ網羅的に（方針/検査/薬/予約など）"],
+  "todos_until_next": ["患者ができる行動。可能なら頻度・タイミング・理由も"],
+  "ask_next_time": ["次回医師に確認したい具体的な質問"],
+  "red_flags": ["受診/連絡の目安（数値・時間など条件を含める）"],
+  "terms_plain": [{"term":"","easy":"","note":""}],
+  "topic_blocks": [{"title":"", "bullets":[""]}],
+  "timeline": [{"when":"", "what":"", "note":""}]
+}
+
+【文字起こし】
+<<TRANSCRIPT>>
+${transcript}
+<</TRANSCRIPT>>
+`.trim();
+
+    const detailModel = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash-lite",
+      generationConfig: {
+        temperature: 0.2,
+        topP: 0.9,
+        maxOutputTokens: 2800,
+        responseMimeType: "application/json",
+      },
+    });
+
+    let full = {};
+    try {
+      const dResp = await detailModel.generateContent(detailPrompt);
+      const dText = dResp.response.text();
+      const m = dText.match(/\{[\s\S]*\}$/);
+      full = JSON.parse(m ? m[0] : dText);
+    } catch (e) {
+      console.error("detail JSON failed:", e?.message);
+      full = { ...j, topic_blocks: [], timeline: [] }; // フォールバック
+    }
+
+    // ---- GCS保存（短いJSON / 詳しいJSON）----
     try {
       await bucket.file(`summaries/${sessionId}.json`).save(JSON.stringify(j, null, 2), {
         resumable: false,
         contentType: "application/json",
         metadata: { cacheControl: "no-store" },
       });
+      await bucket.file(`summaries/${sessionId}.full.json`).save(JSON.stringify(full, null, 2), {
+        resumable: false,
+        contentType: "application/json",
+        metadata: { cacheControl: "no-store" },
+      });
     } catch (e) {
-      console.error("save summary failed:", e?.message);
+      console.error("save summaries failed:", e?.message);
     }
 
-    // ---- LINE 送信（1通目：要約 / 2通目：全文文字起こし）----
-// ---- 整形（読みやすさ重視・セクション化）----
-j.summary_top3 = arr(j.summary_top3);
-j.terms_plain   = arr(j.terms_plain);
+    // ---- LINE整形（短く見やすく）----
+    const cap = (a, n) => arr(a).slice(0, n);
+    const short = (s, n=40) => (s||"").length>n ? (s.slice(0,n-1)+"…") : (s||"");
+    j.summary_top3     = cap(j.summary_top3, 3).map(x => short(x, 40));
+    j.decisions        = cap(j.decisions, 3).map(x => short(x, 40));
+    j.todos_until_next = cap(j.todos_until_next, 5).map(x => short(x, 40));
+    const rf = cap(j.red_flags, 3).map(x => short(x, 40));
+    j.red_flags = rf.length >= 2 ? rf : rf;
+    j.ask_next_time    = cap(j.ask_next_time, 3).map(x => short(x, 40));
+    j.terms_plain      = cap(j.terms_plain, 3).map(t => ({ term: short(t.term, 24), easy: short(t.easy, 40) }));
 
-// 件数と文字数を上限管理
-const cap = (a, n) => arr(a).slice(0, n);
-const short = (s, n=40) => (s||"").length>n ? (s.slice(0,n-1)+"…") : (s||"");
-j.summary_top3     = cap(j.summary_top3, 3).map(x => short(x, 40));
-j.decisions        = cap(j.decisions, 3).map(x => short(x, 40));
-j.todos_until_next = cap(j.todos_until_next, 5).map(x => short(x, 40));
-// red_flags は2〜3件に調整
-const rf = cap(j.red_flags, 3).map(x => short(x, 40));
-j.red_flags = rf.length >= 2 ? rf : rf; // 足りない時はそのまま
-j.ask_next_time    = cap(j.ask_next_time, 3).map(x => short(x, 40));
-j.terms_plain      = cap(j.terms_plain, 3).map(t => ({ term: short(t.term, 24), easy: short(t.easy, 40) }));
+    const bullet = (a) => a.length ? a.map(x => `・ ${x}`).join("\n") : "";
+    const bulletsKV = (a, fmt) => a.length ? a.map(fmt).join("\n") : "";
 
-const bullet = (a) => a.length ? a.map(x => `・ ${x}`).join("\n") : "";
-const bulletsKV = (a, fmt) => a.length ? a.map(fmt).join("\n") : "";
+    const header = "■診察メモ";
+    const top =
+      (j.summary_top3.length
+        ? `🧾 きょうの要点\n${bullet(j.summary_top3)}`
+        : `🧾 きょうの要点\n${bullet((j.summary||"").split(/\n+/).slice(0,3))}`);
 
-const header = "■診察メモ";
-const top =
-  (j.summary_top3.length
-    ? `🧾 きょうの要点\n${bullet(j.summary_top3)}`
-    : `🧾 きょうの要点\n${bullet(j.summary.split(/\n+/).slice(0,3))}`);
+    const secDecisions = j.decisions.length ? `\n\n【決まったこと】\n${bullet(j.decisions)}` : "";
+    const secTodos     = j.todos_until_next.length ? `\n\n✅ あなたがやること\n${bullet(j.todos_until_next)}` : "";
+    const secAsk       = j.ask_next_time.length ? `\n\n❓ 次回ききたいこと\n${bullet(j.ask_next_time)}` : "";
+    const secFlags     = j.red_flags.length ? `\n\n🚩 こんな時は連絡/受診\n${bullet(j.red_flags)}` : "";
+    const secTerms     = j.terms_plain.length
+      ? `\n\n🔎 やさしい言い換え\n` + bulletsKV(j.terms_plain, t => `・ ${t.term}：${t.easy}`)
+      : "";
 
-// 1通目セクション
-const secDecisions = j.decisions.length ? `\n\n【決まったこと】\n${bullet(j.decisions)}` : "";
-const secTodos     = j.todos_until_next.length ? `\n\n✅ あなたがやること\n${bullet(j.todos_until_next)}` : "";
-const secAsk       = j.ask_next_time.length ? `\n\n❓ 次回ききたいこと\n${bullet(j.ask_next_time)}` : "";
-const secFlags     = j.red_flags.length ? `\n\n🚩 こんな時は連絡/受診\n${bullet(j.red_flags)}` : "";
-const secTerms = j.terms_plain.length
-  ? `\n\n🔎 やさしい言い換え\n` + bulletsKV(j.terms_plain, t => `・ ${t.term}：${t.easy}`)
-  : "";
+    let cleaned = [
+      header,
+      top,
+      secDecisions,
+      secTodos,
+      secFlags,
+      secTerms,
+      secAsk
+    ].filter(Boolean).join("\n");
 
-const cleaned = [
-  header,
-  top,
-  secDecisions,
-  secTodos,
-  secFlags,      // 受診目安は上位に（重要度高）
-  secTerms,
-  secAsk
-].filter(Boolean).join("\n");
+    // ---- 詳細HTMLを作成 → 保存 → 署名URL発行 ----
+    try {
+      const htmlFile = bucket.file(`summaries/${sessionId}.html`);
+      await htmlFile.save(buildDetailHtml(full, transcript), {
+        resumable:false,
+        contentType:"text/html; charset=utf-8",
+        metadata:{ cacheControl:"no-store" }
+      });
+      const [detailUrl] = await htmlFile.getSignedUrl({
+        version:"v4",
+        action:"read",
+        expires: Date.now() + DETAIL_URL_TTL_DAYS*24*60*60*1000
+      });
 
-// 2通目セクション
+      cleaned += `\n\n🔗 詳細を見る（${DETAIL_URL_TTL_DAYS}日有効）\n${detailUrl}`;
+    } catch (e) {
+      console.error("build/save detail html failed:", e?.message);
+    }
+
+    // ---- LINEは1通のみ（リンク付き）----
     try {
       if (meta.userId) {
         await lineClient.pushMessage({
           to: meta.userId,
-          messages: [
-            { type: "text", text: cleaned.slice(0, 4000) },
-            { type: "text", text: `＜文字起こし全文＞\n${transcript.slice(0, 4000)}` },
-          ],
+          messages: [{ type: "text", text: cleaned.slice(0, 4999) }],
         });
       }
     } catch (e) {
@@ -454,5 +504,58 @@ app.listen(PORT, HOST, () => {
   console.log(`yorisoi mvp listening on ${HOST}:${PORT}`);
 });
 
+// ---------------- Helpers for Detail HTML ----------------
+function escapeHtml(s="") {
+  return (s || "").replace(/[&<>"']/g, m => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));
+}
 
+function buildDetailHtml(full, transcript) {
+  const li = (t) => t ? `<li>${escapeHtml(t)}</li>` : "";
+  const ul = (arr) => (arr && arr.length) ? `<ul>${arr.map(li).join("")}</ul>` : "";
+  const term = (t) => t ? `<li><b>${escapeHtml(t.term)}</b>：${escapeHtml(t.easy || "")}${t.note?`（${escapeHtml(t.note)}）`:""}</li>` : "";
 
+  const blocks = (full.topic_blocks || []).map(b =>
+    `<h2>${escapeHtml(b.title || "")}</h2>${ul(b.bullets || [])}`).join("");
+
+  const timeline = (full.timeline || []).map(t =>
+    `・${escapeHtml(t.when || "")}：${escapeHtml(t.what || "")}${t.note?`（${escapeHtml(t.note)}）`:""}`).join("<br>");
+
+  return `<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>診察メモ（詳細）</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;margin:16px;line-height:1.72}
+  h1{font-size:20px;margin:8px 0 12px}
+  h2{font-size:16px;margin:22px 0 8px;border-left:4px solid #4a7;padding-left:8px}
+  ul{margin:6px 0 12px 1.2em;padding:0}
+  li{margin:4px 0}
+  .box{background:#fafafa;border:1px solid #eee;border-radius:8px;padding:12px}
+  .muted{color:#666;font-size:12px;margin-top:16px}
+  pre{white-space:pre-wrap;background:#fbfbfb;border:1px solid #eee;border-radius:8px;padding:12px}
+  .pill{display:inline-block;background:#eef7f0;color:#274;font-weight:600;padding:2px 8px;border-radius:999px;font-size:12px}
+</style></head>
+<body>
+  <h1>診察メモ（詳細）</h1>
+
+  <div class="box">
+    <span class="pill">きょうの要点</span>
+    ${ul(full.summary_top3 || [])}
+  </div>
+
+  ${ (full.summary && full.summary.trim()) ? `<h2>概要</h2><div>${escapeHtml(full.summary)}</div>` : "" }
+  ${ (full.decisions?.length) ? `<h2>決まったこと</h2>${ul(full.decisions)}` : "" }
+  ${ (full.todos_until_next?.length) ? `<h2>あなたがやること</h2>${ul(full.todos_until_next)}` : "" }
+  ${ (full.red_flags?.length) ? `<h2>こんな時は連絡/受診</h2>${ul(full.red_flags)}` : "" }
+  ${ (full.ask_next_time?.length) ? `<h2>次回ききたいこと</h2>${ul(full.ask_next_time)}` : "" }
+  ${ (full.terms_plain?.length) ? `<h2>やさしい言い換え</h2><ul>${(full.terms_plain||[]).map(term).join("")}</ul>` : "" }
+
+  ${ blocks || "" }
+  ${ (full.timeline?.length) ? `<h2>予定表</h2><div>${timeline}</div>` : "" }
+
+  <h2>文字起こし（全文）</h2>
+  <pre>${escapeHtml(transcript || "")}</pre>
+
+  <p class="muted">※このメモは診断ではありません。変化や不安がある時は医療者へ相談してください。</p>
+</body></html>`;
+}
