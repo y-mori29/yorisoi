@@ -188,6 +188,7 @@ app.post("/finalize", async (req, res) => {
 
 // 3) ポーリング: /jobs/:id
 app.get("/jobs/:id", async (req, res) => {
+  const t0 = Date.now();
   try {
     const jobId = req.params.id;
 
@@ -268,8 +269,8 @@ app.get("/jobs/:id", async (req, res) => {
       });
     }
 
-    // ---- 1) LINE用・短い要約（JSON）----
-const prompt = `
+    // ---- LLM（短い要約 / 詳細要約）を並列実行 ----
+    const shortPrompt = `
 あなたは「患者さんに寄り添う診察メモ」を作る日本語の編集者です。
 入力は【文字起こし】のみ。診断や断定はせず、事実ベースでやさしく整理してください。
 医療に関係しない話題（仕事/学校/家事/連絡など）も、患者さんの生活に役立つ形で要約・TODOに反映します。
@@ -289,58 +290,12 @@ const prompt = `
   "terms_plain": [ { "term":"", "easy":"" } ]  // 医療の専門用語や難語のやさしい言い換え。最大5件、easyは40字以内
 }
 
-【作成ガイド】
-- summary_top3 は必ず3行。会話文の直写は不可、短文の要約にする。
-- decisions/todos/red_flags/ask_next_time/terms_plain は上限件数を超えないこと。
-- 文字起こしに誤りが疑われる語は、一般的な医学用語に直して記述（訂正一覧は出さない）。
-- 迷う場合は “不明” とし、推測で断定しない。
-
 【文字起こし】
 <<TRANSCRIPT>>
 ${transcript}
 <</TRANSCRIPT>>
 `.trim();
 
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash-lite",
-      generationConfig: {
-        temperature: 0.2,
-        topP: 0.9,
-        maxOutputTokens: 1800,
-        responseMimeType: "application/json"
-      },
-    });
-
-    const gem = await model.generateContent(prompt);
-    let raw = (gem.response && gem.response.text && gem.response.text()) || "";
-    const jsonText = (() => {
-      const m = raw.match(/```json([\s\S]*?)```/i);
-      return (m ? m[1] : raw).trim();
-    })();
-
-    let j;
-    try {
-      j = JSON.parse(jsonText);
-    } catch (e) {
-      console.error("Gemini JSON parse failed:", e, "raw:", raw);
-      j = {
-        summary: transcript.split(/\n/).slice(0, 3).join("\n"),
-        decisions: [],
-        todos_until_next: [],
-        ask_next_time: [],
-        red_flags: [],
-      };
-    }
-    const arr = (v) => (Array.isArray(v) ? v : []);
-    j.decisions = arr(j.decisions);
-    j.todos_until_next = arr(j.todos_until_next);
-    j.ask_next_time = arr(j.ask_next_time);
-    j.red_flags = arr(j.red_flags);
-    j.summary = (j.summary || "").toString().trim();
-    j.summary_top3 = arr(j.summary_top3);
-    j.terms_plain = arr(j.terms_plain);
-
-    // ---- 2) 詳細用・濃い要約（JSON）----
     const detailPrompt = `
 あなたは患者さんに寄り添う編集者です。以下の文字起こしから、詳しい診察メモをJSONで作成します。
 会話の引用は避けて要約文で書き、誤変換や表記ゆれは**静かに一般的な正式名称へ正規化**してください。
@@ -365,42 +320,65 @@ ${transcript}
 <</TRANSCRIPT>>
 `.trim();
 
+    const shortModel = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash-lite",
+      generationConfig: { temperature: 0.2, topP: 0.9, maxOutputTokens: 1800, responseMimeType: "application/json" },
+    });
     const detailModel = genAI.getGenerativeModel({
       model: "gemini-2.5-flash-lite",
-      generationConfig: {
-        temperature: 0.2,
-        topP: 0.9,
-        maxOutputTokens: 2800,
-        responseMimeType: "application/json",
-      },
+      generationConfig: { temperature: 0.2, topP: 0.9, maxOutputTokens: 2800, responseMimeType: "application/json" },
     });
 
+    const shortGen = shortModel.generateContent(shortPrompt);
+    const detailGen = detailModel.generateContent(detailPrompt);
+
+    const [shortResp, detailResp] = await Promise.all([shortGen, detailGen]);
+    console.log(`[jobs] llm parallel ms=${Date.now()-t0}`);
+
+    // ---- 短い要約のパース ----
+    let j;
+    try {
+      const raw = shortResp.response.text();
+      const m = raw.match(/```json([\s\S]*?)```/i);
+      const jsonText = (m ? m[1] : raw).trim();
+      j = JSON.parse(jsonText);
+    } catch (e) {
+      console.error("short JSON parse failed:", e?.message);
+      j = { summary_top3: [], decisions: [], todos_until_next: [], ask_next_time: [], red_flags: [], terms_plain: [] };
+    }
+    const arr = (v) => (Array.isArray(v) ? v : []);
+    j.summary_top3 = arr(j.summary_top3);
+    j.decisions = arr(j.decisions);
+    j.todos_until_next = arr(j.todos_until_next);
+    j.ask_next_time = arr(j.ask_next_time);
+    j.red_flags = arr(j.red_flags);
+    j.terms_plain = arr(j.terms_plain);
+
+    // ---- 詳細要約のパース ----
     let full = {};
     try {
-      const dResp = await detailModel.generateContent(detailPrompt);
-      const dText = dResp.response.text();
-      const m = dText.match(/\{[\s\S]*\}$/);
-      full = JSON.parse(m ? m[0] : dText);
+      const dText = detailResp.response.text();
+      const dm = dText.match(/\{[\s\S]*\}$/);
+      full = JSON.parse(dm ? dm[0] : dText);
     } catch (e) {
-      console.error("detail JSON failed:", e?.message);
-      full = { ...j, topic_blocks: [], timeline: [] }; // フォールバック
+      console.error("detail JSON parse failed:", e?.message);
+      full = { summary: "", summary_top3: j.summary_top3, decisions: j.decisions, todos_until_next: j.todos_until_next, ask_next_time: j.ask_next_time, red_flags: j.red_flags, terms_plain: j.terms_plain, topic_blocks: [], timeline: [] };
     }
 
-    // ---- GCS保存（短いJSON / 詳しいJSON）----
-    try {
-      await bucket.file(`summaries/${sessionId}.json`).save(JSON.stringify(j, null, 2), {
-        resumable: false,
-        contentType: "application/json",
-        metadata: { cacheControl: "no-store" },
-      });
-      await bucket.file(`summaries/${sessionId}.full.json`).save(JSON.stringify(full, null, 2), {
-        resumable: false,
-        contentType: "application/json",
-        metadata: { cacheControl: "no-store" },
-      });
-    } catch (e) {
-      console.error("save summaries failed:", e?.message);
-    }
+    // ---- GCS保存（短いJSON / 詳しいJSON / HTML）を並列 ----
+    const htmlStr = buildDetailHtml(full, transcript);
+    const htmlFile = bucket.file(`summaries/${sessionId}.html`);
+    await Promise.all([
+      bucket.file(`summaries/${sessionId}.json`).save(JSON.stringify(j, null, 2), { resumable:false, contentType:"application/json", metadata:{ cacheControl:"no-store" } }),
+      bucket.file(`summaries/${sessionId}.full.json`).save(JSON.stringify(full, null, 2), { resumable:false, contentType:"application/json", metadata:{ cacheControl:"no-store" } }),
+      htmlFile.save(htmlStr, { resumable:false, contentType:"text/html; charset=utf-8", metadata:{ cacheControl:"no-store" } }),
+    ]);
+
+    const [detailUrl] = await htmlFile.getSignedUrl({
+      version: "v4",
+      action: "read",
+      expires: Date.now() + DETAIL_URL_TTL_DAYS*24*60*60*1000
+    });
 
     // ---- LINE整形（短く見やすく）----
     const cap = (a, n) => arr(a).slice(0, n);
@@ -420,7 +398,7 @@ ${transcript}
     const top =
       (j.summary_top3.length
         ? `🧾 きょうの要点\n${bullet(j.summary_top3)}`
-        : `🧾 きょうの要点\n${bullet((j.summary||"").split(/\n+/).slice(0,3))}`);
+        : `🧾 きょうの要点\n${bullet([].slice.call((j.summary||"").split(/\n+/),0,3))}`);
 
     const secDecisions = j.decisions.length ? `\n\n【決まったこと】\n${bullet(j.decisions)}` : "";
     const secTodos     = j.todos_until_next.length ? `\n\n✅ あなたがやること\n${bullet(j.todos_until_next)}` : "";
@@ -440,37 +418,42 @@ ${transcript}
       secAsk
     ].filter(Boolean).join("\n");
 
-    // ---- 詳細HTMLを作成 → 保存 → 署名URL発行 ----
-    try {
-      const htmlFile = bucket.file(`summaries/${sessionId}.html`);
-      await htmlFile.save(buildDetailHtml(full, transcript), {
-        resumable:false,
-        contentType:"text/html; charset=utf-8",
-        metadata:{ cacheControl:"no-store" }
-      });
-      const [detailUrl] = await htmlFile.getSignedUrl({
-        version:"v4",
-        action:"read",
-        expires: Date.now() + DETAIL_URL_TTL_DAYS*24*60*60*1000
-      });
+    cleaned += `\n\n🔗 詳細を見る（${DETAIL_URL_TTL_DAYS}日有効）\n${detailUrl}`;
 
-      cleaned += `\n\n🔗 詳細を見る（${DETAIL_URL_TTL_DAYS}日有効）\n${detailUrl}`;
+    // ---- 冪等化（重複送信防止）：GCSマーカーを ifGenerationMatch:0 で作成 ----
+    const deliveryMarker = bucket.file(`deliveries/${jobId}.done`);
+    let acquired = false;
+    try {
+      await deliveryMarker.save(
+        JSON.stringify({ pushedAt: new Date().toISOString(), sessionId, detailUrl }, null, 2),
+        {
+          resumable: false,
+          contentType: "application/json",
+          ifGenerationMatch: 0, // 既存なら412
+        }
+      );
+      acquired = true;
     } catch (e) {
-      console.error("build/save detail html failed:", e?.message);
+      if (e.code === 412) {
+        // 既に他インスタンスが送信済み
+        return res.json({ ok: true, status: "DONE", transcript });
+      }
+      throw e;
     }
 
-    // ---- LINEは1通のみ（リンク付き）----
-    try {
-      if (meta.userId) {
+    // ---- LINE送信（1通のみ）----
+    if (acquired && meta.userId) {
+      try {
         await lineClient.pushMessage({
           to: meta.userId,
           messages: [{ type: "text", text: cleaned.slice(0, 4999) }],
         });
+      } catch (e) {
+        console.error("LINE push failed:", e?.statusCode, e?.message);
       }
-    } catch (e) {
-      console.error("LINE push failed:", e?.statusCode, e?.message);
     }
 
+    console.log(`[jobs] total ms=${Date.now()-t0}`);
     return res.json({ ok: true, status: "DONE", transcript, summary: cleaned });
   } catch (e) {
     console.error("[/jobs] error", e);
