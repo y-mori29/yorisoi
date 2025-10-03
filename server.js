@@ -17,7 +17,7 @@ const GCS_BUCKET = process.env.GCS_BUCKET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 // const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET; // 未使用
-const DETAIL_URL_TTL_DAYS = Number(process.env.DETAIL_URL_TTL_DAYS || "7"); // 署名URLの有効日数
+const DETAIL_URL_TTL_DAYS = Number(process.env.DETAIL_URL_TTL_DAYS || "7"); // 詳細HTMLの署名URL期限（日）
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -73,15 +73,14 @@ function parseJsonLoose(s) {
   // 先頭{〜末尾} を抽出
   const start = t.indexOf("{");
   const end = t.lastIndexOf("}");
-  if (start >= 0 && end > start) {
-    t = t.slice(start, end + 1);
-  }
+  if (start >= 0 && end > start) t = t.slice(start, end + 1);
   return JSON.parse(t);
 }
 function shortText(s, n = 40) {
   const str = (s || "").trim();
   return str.length > n ? str.slice(0, n - 1) + "…" : str;
 }
+const arrify = (v) => (Array.isArray(v) ? v : []);
 
 /**
  * sources を最大32個ずつ合成しながら最終的に 1 本にまとめる
@@ -115,6 +114,22 @@ async function composeMany(objects /* File[] */, destFile /* File */) {
     await queue[0].copy(destFile);
   }
   try { await destFile.bucket.deleteFiles({ prefix: `${destFile.name}.compose.` }); } catch {}
+}
+
+// ---- LINE 冪等プッシュ（X-Line-Retry-Key を UUID で永続化 & 409は成功扱い）----
+async function safePushLine(to, messages, retryKey) {
+  try {
+    // SDK v9+ では pushMessage(body, xLineRetryKey:string) が使える
+    return await lineClient.pushMessage({ to, messages }, retryKey);
+  } catch (e) {
+    // duplicate は成功相当として握りつぶす
+    if (e?.statusCode === 409) {
+      console.warn("LINE push deduplicated by retry key:", retryKey);
+      return;
+    }
+    // 署名キー形式NGなどはそのままスロー
+    throw e;
+  }
 }
 
 // ---------------- Routes ----------------
@@ -257,7 +272,7 @@ app.get("/jobs/:id", async (req, res) => {
       return res.json({ ok: true, status: "DONE" });
     }
 
-    // ▼ SDK差異に両対応（配列でも単体でも）
+    // STT 進捗
     const progress = await speechClient.checkLongRunningRecognizeProgress(jobId);
     const op = Array.isArray(progress) ? progress[0] : progress;
     if (!op) {
@@ -269,14 +284,14 @@ app.get("/jobs/:id", async (req, res) => {
       return res.json({ ok: true, status: "RUNNING" });
     }
 
-    // 配信ロック（重複防止）: 取得できなければ他が処理中なので早期return
+    // 配信ロック（重複防止）：取れなければ他インスタンスが処理中
     const lockFile = bucket.file(`deliveries/${jobId}.lock`);
     const locked = await acquireLock(lockFile, { jobId, at: new Date().toISOString() });
     if (!locked) {
       return res.json({ ok: true, status: "DONE" });
     }
 
-    // ▼ 結果抽出（op.promise() 互換）
+    // 結果抽出（op.promise() 互換）
     let response;
     if (typeof op.promise === "function") {
       const result = await op.promise();
@@ -289,12 +304,8 @@ app.get("/jobs/:id", async (req, res) => {
       const p2 = await speechClient.checkLongRunningRecognizeProgress(jobId);
       const op2 = Array.isArray(p2) ? p2[0] : p2;
       if (op2 && op2.result) response = op2.result;
-      else if (op2 && op2.latestResponse && op2.latestResponse.response)
-        response = op2.latestResponse.response;
-      else {
-        console.error("[/jobs] cannot extract response from operation");
-        return res.status(500).json({ ok: false, error: "cannot extract STT response" });
-      }
+      else if (op2 && op2.latestResponse && op2.latestResponse.response) response = op2.latestResponse.response;
+      else return res.status(500).json({ ok: false, error: "cannot extract STT response" });
     }
 
     const transcript = (response.results || [])
@@ -315,6 +326,16 @@ app.get("/jobs/:id", async (req, res) => {
     }
     const sessionId = meta.sessionId || `unknown-${jobId}`;
 
+    // 既に詳細HTMLがあれば、誰かが生成済みとみなしてDONEにして終了
+    const htmlFile = bucket.file(`summaries/${sessionId}.html`);
+    if (await gcsExists(htmlFile)) {
+      try {
+        await doneFile.save(JSON.stringify({ from: "existing-summary", at: new Date().toISOString() }, null, 2),
+                           { resumable:false, contentType:"application/json", ifGenerationMatch: 0 });
+      } catch {}
+      return res.json({ ok: true, status: "DONE" });
+    }
+
     // transcript を GCS 保存
     try {
       await bucket.file(`transcripts/${sessionId}.txt`).save(transcript || "", {
@@ -326,21 +347,32 @@ app.get("/jobs/:id", async (req, res) => {
       console.error("save transcript failed:", e?.message);
     }
 
-    // 短すぎる→軽い通知のみ
+    // 短すぎる→軽い通知のみ（1通）
     if (!transcript || transcript.replace(/\s/g, "").length < 15) {
+      // リトライキーを job 単位で発行・保存
+      const retryKeyObj = bucket.file(`deliveries/${jobId}.retryKey`);
+      let retryKey;
+      try {
+        const [buf] = await retryKeyObj.download();
+        retryKey = buf.toString("utf-8").trim();
+      } catch {
+        retryKey = uuidv4();
+        await retryKeyObj.save(retryKey, { resumable:false, contentType:"text/plain" });
+      }
+
       try {
         if (meta.userId) {
-          await lineClient.pushMessage({
-            to: meta.userId,
-            messages: [{ type: "text", text: "■診察メモ\n（短い内容のためメモは作成しませんでした）" }],
-          });
+          await safePushLine(meta.userId, [{ type: "text", text: "■診察メモ\n（短い内容のためメモは作成しませんでした）" }], retryKey);
         }
       } catch (e) {
         console.error("LINE push (short) failed:", e?.statusCode, e?.message);
       } finally {
-        // done マーク & lock解放
-        try { await doneFile.save(JSON.stringify({ short: true, at: new Date().toISOString() }, null, 2), { resumable:false, contentType:"application/json" }); } catch {}
-        try { await lockFile.delete(); } catch {}
+        // done マーク（ロックは残す：ライフサイクルで削除）
+        try {
+          await doneFile.save(JSON.stringify({ short: true, at: new Date().toISOString() }, null, 2), {
+            resumable:false, contentType:"application/json"
+          });
+        } catch {}
       }
       return res.json({ ok: true, status: "DONE", transcript });
     }
@@ -419,13 +451,12 @@ ${transcript}
       console.error("short JSON parse failed:", e?.message);
       j = { summary_top3: [], decisions: [], todos_until_next: [], ask_next_time: [], red_flags: [], terms_plain: [] };
     }
-    const arr = (v) => (Array.isArray(v) ? v : []);
-    j.summary_top3 = arr(j.summary_top3);
-    j.decisions = arr(j.decisions);
-    j.todos_until_next = arr(j.todos_until_next);
-    j.ask_next_time = arr(j.ask_next_time);
-    j.red_flags = arr(j.red_flags);
-    j.terms_plain = arr(j.terms_plain);
+    j.summary_top3 = arrify(j.summary_top3);
+    j.decisions = arrify(j.decisions);
+    j.todos_until_next = arrify(j.todos_until_next);
+    j.ask_next_time = arrify(j.ask_next_time);
+    j.red_flags = arrify(j.red_flags);
+    j.terms_plain = arrify(j.terms_plain);
 
     // ---- 詳細要約のパース ----
     let full = {};
@@ -433,15 +464,29 @@ ${transcript}
       full = parseJsonLoose(detailResp.response.text());
     } catch (e) {
       console.error("detail JSON parse failed:", e?.message);
-      full = { summary: "", summary_top3: j.summary_top3, decisions: j.decisions, todos_until_next: j.todos_until_next, ask_next_time: j.ask_next_time, red_flags: j.red_flags, terms_plain: j.terms_plain, topic_blocks: [], timeline: [] };
+      full = {
+        summary: "",
+        summary_top3: j.summary_top3,
+        decisions: j.decisions,
+        todos_until_next: j.todos_until_next,
+        ask_next_time: j.ask_next_time,
+        red_flags: j.red_flags,
+        terms_plain: j.terms_plain,
+        topic_blocks: [],
+        timeline: [],
+      };
     }
 
     // ---- GCS保存（短いJSON / 詳しいJSON / HTML）を並列 ----
     const htmlStr = buildDetailHtml(full, transcript);
     const htmlFile = bucket.file(`summaries/${sessionId}.html`);
     await Promise.all([
-      bucket.file(`summaries/${sessionId}.json`).save(JSON.stringify(j, null, 2), { resumable:false, contentType:"application/json", metadata:{ cacheControl:"no-store" } }),
-      bucket.file(`summaries/${sessionId}.full.json`).save(JSON.stringify(full, null, 2), { resumable:false, contentType:"application/json", metadata:{ cacheControl:"no-store" } }),
+      bucket.file(`summaries/${sessionId}.json`).save(JSON.stringify(j, null, 2), {
+        resumable:false, contentType:"application/json", metadata:{ cacheControl:"no-store" }
+      }),
+      bucket.file(`summaries/${sessionId}.full.json`).save(JSON.stringify(full, null, 2), {
+        resumable:false, contentType:"application/json", metadata:{ cacheControl:"no-store" }
+      }),
       htmlFile.save(htmlStr, { resumable:false, contentType:"text/html; charset=utf-8", metadata:{ cacheControl:"no-store" } }),
     ]);
 
@@ -452,12 +497,11 @@ ${transcript}
     });
 
     // ---- LINE整形（短く見やすく・1通）----
-    const cap = (a, n) => arr(a).slice(0, n);
+    const cap = (a, n) => arrify(a).slice(0, n);
     j.summary_top3     = cap(j.summary_top3, 3).map(x => shortText(x, 40));
     j.decisions        = cap(j.decisions, 3).map(x => shortText(x, 40));
     j.todos_until_next = cap(j.todos_until_next, 5).map(x => shortText(x, 40));
-    const rf = cap(j.red_flags, 3).map(x => shortText(x, 40));
-    j.red_flags        = rf;
+    j.red_flags        = cap(j.red_flags, 3).map(x => shortText(x, 40));
     j.ask_next_time    = cap(j.ask_next_time, 3).map(x => shortText(x, 40));
     j.terms_plain      = cap(j.terms_plain, 3).map(t => ({ term: shortText(t.term, 24), easy: shortText(t.easy, 40) }));
 
@@ -472,11 +516,11 @@ ${transcript}
 
     const secDecisions = j.decisions.length ? `\n\n【決まったこと】\n${bullet(j.decisions)}` : "";
     const secTodos     = j.todos_until_next.length ? `\n\n✅ あなたがやること\n${bullet(j.todos_until_next)}` : "";
-    const secAsk       = j.ask_next_time.length ? `\n\n❓ 次回ききたいこと\n${bullet(j.ask_next_time)}` : "";
     const secFlags     = j.red_flags.length ? `\n\n🚩 こんな時は連絡/受診\n${bullet(j.red_flags)}` : "";
     const secTerms     = j.terms_plain.length
       ? `\n\n🔎 やさしい言い換え\n` + bulletsKV(j.terms_plain, t => `・ ${t.term}：${t.easy}`)
       : "";
+    const secAsk       = j.ask_next_time.length ? `\n\n❓ 次回ききたいこと\n${bullet(j.ask_next_time)}` : "";
 
     let cleaned = [
       header,
@@ -490,13 +534,21 @@ ${transcript}
 
     cleaned += `\n\n🔗 詳細を見る（${DETAIL_URL_TTL_DAYS}日有効）\n${detailUrl}`;
 
-    // ---- 配信done マーク（先にdoneを書いてもOKだが、送信後に書く）----
+    // ---- リトライキーを job 単位で発行・保存（UUID）----
+    const retryKeyObj = bucket.file(`deliveries/${jobId}.retryKey`);
+    let retryKey;
+    try {
+      const [buf] = await retryKeyObj.download();
+      retryKey = buf.toString("utf-8").trim();
+    } catch {
+      retryKey = uuidv4(); // RFC4122形式
+      await retryKeyObj.save(retryKey, { resumable:false, contentType:"text/plain" });
+    }
+
+    // ---- 配信（1通のみ） & done 記録（ロックは削除しない）----
     try {
       if (meta.userId) {
-        await lineClient.pushMessage({
-          to: meta.userId,
-          messages: [{ type: "text", text: cleaned.slice(0, 4999) }],
-        });
+        await safePushLine(meta.userId, [{ type: "text", text: cleaned.slice(0, 4999) }], retryKey);
       }
     } catch (e) {
       console.error("LINE push failed:", e?.statusCode, e?.message);
@@ -506,8 +558,10 @@ ${transcript}
           resumable: false,
           contentType: "application/json",
         });
-      } catch {}
-      try { await lockFile.delete(); } catch {}
+      } catch (e) {
+        console.error("write done failed:", e?.message);
+      }
+      // ロックは削除しない（GCSのライフサイクルで自動削除）
     }
 
     console.log(`[jobs] total ms=${Date.now()-t0}`);
