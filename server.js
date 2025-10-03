@@ -27,13 +27,15 @@ app.use(cors({ origin: ORIGIN, credentials: true }));
 app.options("*", cors());
 app.use(express.json());
 
-const upload = multer({ dest: path.join(DATA_DIR, "chunks") });
+const upload = multer({ dest: path.join(DATA_DIR, "chunks") }); // 署名URL直PUT方式なので現状未使用
 
 // ---------------- GCP Clients ----------------
 const storage = new Storage();
 const bucket = storage.bucket(GCS_BUCKET);
 const speechClient = new speech.SpeechClient();
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+
+// LINE SDK（reply など最小限に使用。push は fetch で冪等キー付与）
 const { messagingApi } = require("@line/bot-sdk");
 const lineClient = new messagingApi.MessagingApiClient({
   channelAccessToken: LINE_CHANNEL_ACCESS_TOKEN,
@@ -117,6 +119,34 @@ async function composeMany(objects /* File[] */, destFile /* File */) {
   try { await destFile.bucket.deleteFiles({ prefix: `${destFile.name}.compose.` }); } catch {}
 }
 
+// ---------------- LINE Push（冪等キー付き・生HTTP） ----------------
+const LINE_PUSH_ENDPOINT = "https://api.line.me/v2/bot/message/push";
+
+/**
+ * LINEへ push（X-Line-Retry-Key で冪等化）
+ * @param {string} to
+ * @param {Array} messages
+ * @param {string} retryKey  例: `job:${jobId}`
+ */
+async function sendLinePush(to, messages, retryKey) {
+  const body = { to, messages };
+  const res = await fetch(LINE_PUSH_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+      "X-Line-Retry-Key": retryKey || uuidv4(),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    const err = new Error(`LINE push failed: ${res.status} ${res.statusText} ${text}`);
+    err.status = res.status;
+    throw err;
+  }
+}
+
 // ---------------- Routes ----------------
 
 // 1) 署名URL発行（クライアントがPUTでチャンクを直アップロード）
@@ -152,8 +182,10 @@ app.post("/finalize", async (req, res) => {
     if (!sessionId || !userId)
       return res.status(400).json({ ok: false, error: "sessionId/userId required" });
 
-    // セッション冪等化（既にjobがあればそれを返す）
     const sessionMetaFile = bucket.file(`jobs-meta/by-session/${sessionId}.json`);
+    const finalizeLock    = bucket.file(`locks/finalize/${sessionId}.lock`);
+
+    // 既存ジョブがあればそれを返す
     if (await gcsExists(sessionMetaFile)) {
       try {
         const [buf] = await sessionMetaFile.download();
@@ -164,81 +196,99 @@ app.post("/finalize", async (req, res) => {
       } catch {}
     }
 
-    // チャンク一覧
-    const prefix = `sessions/${sessionId}/`;
-    const [files] = await bucket.getFiles({ prefix });
-    const chunks = files
-      .filter((f) => /chunk-\d+\.(webm|mp4)$/.test(f.name))
-      .sort((a, b) => a.name.localeCompare(b.name));
-    if (chunks.length === 0) return res.status(400).json({ ok: false, error: "no chunks in GCS" });
-
-    // GCS compose → 1本化
-    const ext = chunks[0].name.endsWith(".mp4") ? "mp4" : "webm";
-    const assembledObj = bucket.file(`sessions/${sessionId}/assembled.${ext}`);
-    await composeMany(chunks.map((c) => bucket.file(c.name)), assembledObj);
-
-    // ffmpegでWAV化
-    const workDir = path.join(DATA_DIR, "sessions", sessionId);
-    fs.mkdirSync(workDir, { recursive: true });
-    const localAssembled = path.join(workDir, `assembled.${ext}`);
-    const mergedWav = path.join(workDir, "merged.wav");
-
-    await assembledObj.download({ destination: localAssembled });
-    await execFFmpeg(["-i", localAssembled, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", mergedWav]);
-
-    // GCSへアップ（STT入力）
-    const gcsName = `audio/${sessionId}.wav`;
-    await bucket.upload(mergedWav, { destination: gcsName, contentType: "audio/wav" });
-    const gcsUri = `gs://${GCS_BUCKET}/${gcsName}`;
-
-    try { fs.unlinkSync(localAssembled); } catch {}
-    try { fs.unlinkSync(mergedWav); } catch {}
-
-    // STT起動
-    const [op] = await speechClient.longRunningRecognize({
-      audio: { uri: gcsUri },
-      config: {
-        languageCode: "ja-JP",
-        encoding: "LINEAR16",
-        sampleRateHertz: 16000,
-        enableAutomaticPunctuation: true,
-        model: "latest_long",
-      },
-    });
-    let jobId = op.name;
-
-    // GCSにジョブメタを原子的に保存（同時起動レース対策）
-    try {
-      await sessionMetaFile.save(JSON.stringify({ sessionId, userId, gcsUri, jobId }, null, 2), {
-        resumable: false,
-        contentType: "application/json",
-        ifGenerationMatch: 0,
-      });
-    } catch (e) {
-      if (e.code === 412) {
-        // 他インスタンスが先に保存 -> そのjobIdを返す
+    // --- ロック取得（先に誰かが処理を始めたらここで弾く）---
+    const locked = await acquireLock(finalizeLock, { sessionId, userId, at: new Date().toISOString() });
+    if (!locked) {
+      // 別リクエストが finalize 中。メタに jobId があれば返し、なければ処理中だけ返す
+      try {
         const [buf] = await sessionMetaFile.download();
         const prev = JSON.parse(buf.toString("utf-8"));
-        jobId = prev.jobId || jobId;
-      } else {
-        throw e;
-      }
+        if (prev && prev.jobId) return res.json({ ok: true, jobId: prev.jobId });
+      } catch {}
+      return res.status(202).json({ ok: true, pending: true });
     }
 
-    // /tmp にも（互換）
-    const jobsDir = path.join(DATA_DIR, "jobs");
-    fs.mkdirSync(jobsDir, { recursive: true });
-    fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), JSON.stringify({ sessionId, userId, gcsUri }, null, 2));
-
-    // jobId基準のメタ（/jobsで引けるように）
     try {
-      await bucket.file(`jobs-meta/by-job/${jobId}.json`).save(
-        JSON.stringify({ sessionId, userId, gcsUri, jobId }, null, 2),
-        { resumable: false, contentType: "application/json", metadata:{cacheControl:"no-store"} }
-      );
-    } catch {}
+      // チャンク一覧
+      const prefix = `sessions/${sessionId}/`;
+      const [files] = await bucket.getFiles({ prefix });
+      const chunks = files
+        .filter((f) => /chunk-\d+\.(webm|mp4)$/.test(f.name))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      if (chunks.length === 0) return res.status(400).json({ ok: false, error: "no chunks in GCS" });
 
-    res.json({ ok: true, jobId });
+      // GCS compose → 1本化
+      const ext = chunks[0].name.endsWith(".mp4") ? "mp4" : "webm";
+      const assembledObj = bucket.file(`sessions/${sessionId}/assembled.${ext}`);
+      await composeMany(chunks.map((c) => bucket.file(c.name)), assembledObj);
+
+      // ffmpegでWAV化
+      const workDir = path.join(DATA_DIR, "sessions", sessionId);
+      fs.mkdirSync(workDir, { recursive: true });
+      const localAssembled = path.join(workDir, `assembled.${ext}`);
+      const mergedWav = path.join(workDir, "merged.wav");
+
+      await assembledObj.download({ destination: localAssembled });
+      await execFFmpeg(["-i", localAssembled, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", mergedWav]);
+
+      // GCSへアップ（STT入力）
+      const gcsName = `audio/${sessionId}.wav`;
+      await bucket.upload(mergedWav, { destination: gcsName, contentType: "audio/wav" });
+      const gcsUri = `gs://${GCS_BUCKET}/${gcsName}`;
+
+      try { fs.unlinkSync(localAssembled); } catch {}
+      try { fs.unlinkSync(mergedWav); } catch {}
+
+      // STT起動
+      const [op] = await speechClient.longRunningRecognize({
+        audio: { uri: gcsUri },
+        config: {
+          languageCode: "ja-JP",
+          encoding: "LINEAR16",
+          sampleRateHertz: 16000,
+          enableAutomaticPunctuation: true,
+          model: "latest_long",
+        },
+      });
+      let jobId = op.name;
+
+      // GCSにジョブメタを原子的に保存（同時起動レース対策）
+      try {
+        await sessionMetaFile.save(JSON.stringify({ sessionId, userId, gcsUri, jobId }, null, 2), {
+          resumable: false,
+          contentType: "application/json",
+          ifGenerationMatch: 0,
+        });
+      } catch (e) {
+        if (e.code === 412) {
+          // 他インスタンスが先に保存 -> そのjobIdを返す
+          const [buf] = await sessionMetaFile.download();
+          const prev = JSON.parse(buf.toString("utf-8"));
+          jobId = prev.jobId || jobId;
+        } else {
+          throw e;
+        }
+      }
+
+      // /tmp にも（互換）
+      const jobsDir = path.join(DATA_DIR, "jobs");
+      fs.mkdirSync(jobsDir, { recursive: true });
+      fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), JSON.stringify({ sessionId, userId, gcsUri }, null, 2));
+
+      // jobId基準のメタ（/jobsで引けるように）
+      try {
+        await bucket.file(`jobs-meta/by-job/${jobId}.json`).save(
+          JSON.stringify({ sessionId, userId, gcsUri, jobId }, null, 2),
+          { resumable: false, contentType: "application/json", metadata:{cacheControl:"no-store"} }
+        );
+      } catch {}
+
+      res.json({ ok: true, jobId });
+    } catch (e) {
+      throw e;
+    } finally {
+      try { await finalizeLock.delete(); } catch {}
+    }
   } catch (e) {
     console.error("[/finalize] error", e);
     res.status(500).json({ ok: false, error: String(e) });
@@ -326,20 +376,20 @@ app.get("/jobs/:id", async (req, res) => {
       console.error("save transcript failed:", e?.message);
     }
 
-    // 短すぎる→軽い通知のみ
+    // 短すぎる→軽い通知のみ（冪等キー付きで送信）
     if (!transcript || transcript.replace(/\s/g, "").length < 15) {
       try {
         if (meta.userId) {
-          await lineClient.pushMessage({
-            to: meta.userId,
-            messages: [{ type: "text", text: "■診察メモ\n（短い内容のためメモは作成しませんでした）" }],
-          });
+          const text = "■診察メモ\n（短い内容のためメモは作成しませんでした）";
+          await sendLinePush(meta.userId, [{ type: "text", text }], `job:${jobId}:short`);
         }
       } catch (e) {
-        console.error("LINE push (short) failed:", e?.statusCode, e?.message);
+        console.error("LINE push (short) failed:", e?.status, e?.message);
       } finally {
         // done マーク & lock解放
-        try { await doneFile.save(JSON.stringify({ short: true, at: new Date().toISOString() }, null, 2), { resumable:false, contentType:"application/json" }); } catch {}
+        try {
+          await doneFile.save(JSON.stringify({ short: true, at: new Date().toISOString() }, null, 2), { resumable:false, contentType:"application/json" });
+        } catch {}
         try { await lockFile.delete(); } catch {}
       }
       return res.json({ ok: true, status: "DONE", transcript });
@@ -490,16 +540,17 @@ ${transcript}
 
     cleaned += `\n\n🔗 詳細を見る（${DETAIL_URL_TTL_DAYS}日有効）\n${detailUrl}`;
 
-    // ---- 配信done マーク（先にdoneを書いてもOKだが、送信後に書く）----
+    // ---- 配信（冪等キー付き） -> done 記録 -> ロック解放
     try {
       if (meta.userId) {
-        await lineClient.pushMessage({
-          to: meta.userId,
-          messages: [{ type: "text", text: cleaned.slice(0, 4999) }],
-        });
+        await sendLinePush(
+          meta.userId,
+          [{ type: "text", text: cleaned.slice(0, 4999) }],
+          `job:${jobId}`
+        );
       }
     } catch (e) {
-      console.error("LINE push failed:", e?.statusCode, e?.message);
+      console.error("LINE push failed:", e?.status, e?.message);
     } finally {
       try {
         await doneFile.save(JSON.stringify({ pushedAt: new Date().toISOString(), sessionId, detailUrl }, null, 2), {
@@ -587,6 +638,7 @@ function buildDetailHtml(full, transcript) {
   ${ (full.todos_until_next?.length) ? `<h2>あなたがやること</h2>${ul(full.todos_until_next)}` : "" }
   ${ (full.red_flags?.length) ? `<h2>こんな時は連絡/受診</h2>${ul(full.red_flags)}` : "" }
   ${ (full.ask_next_time?.length) ? `<h2>次回ききたいこと</h2>${ul(full.ask_next_time)}` : "" }
+
   ${ (full.terms_plain?.length) ? `<h2>やさしい言い換え</h2><ul>${(full.terms_plain||[]).map(term).join("")}</ul>` : "" }
 
   ${ blocks || "" }
