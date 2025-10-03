@@ -479,7 +479,6 @@ ${transcript}
 
     // ---- GCS保存（短いJSON / 詳しいJSON / HTML）を並列 ----
     const htmlStr = buildDetailHtml(full, transcript);
-    const htmlFile = bucket.file(`summaries/${sessionId}.html`);
     await Promise.all([
       bucket.file(`summaries/${sessionId}.json`).save(JSON.stringify(j, null, 2), {
         resumable:false, contentType:"application/json", metadata:{ cacheControl:"no-store" }
@@ -652,3 +651,4 @@ function buildDetailHtml(full, transcript) {
   <p class="muted">※このメモは診断ではありません。変化や不安がある時は医療者へ相談してください。</p>
 </body></html>`;
 }
+
